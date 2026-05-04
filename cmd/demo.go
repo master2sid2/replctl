@@ -4,21 +4,20 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"strconv"
 	"time"
 
 	"github.com/fatih/color"
 	mysqlpkg "github.com/local/mysqlctl/internal/mysql"
-	"github.com/local/mysqlctl/internal/progress"
 )
 
 const demoBanner = "\033[1;33m[DEMO MODE]\033[0m"
 
-// demoClone simulates the full clone workflow with a fake progress bar.
+// demoClone simulates the full clone workflow with per-stage progress display.
 func demoClone(ctx context.Context, src, dst string) error {
 	info := color.New(color.FgGreen)
 	warn := color.New(color.FgRed, color.Bold)
-	yellow := color.New(color.FgYellow)
 
 	fmt.Printf("%s  No real MySQL connections will be made.\n\n", demoBanner)
 
@@ -28,130 +27,153 @@ func demoClone(ctx context.Context, src, dst string) error {
 	warn.Println("WARNING: ALL DATA ON DESTINATION WILL BE REPLACED!")
 	fmt.Println()
 	fmt.Print("Continue? (Y/y to confirm): ")
-
-	// In demo mode, auto-confirm after a short pause to look natural.
-	time.Sleep(600 * time.Millisecond)
+	demoSleep(ctx, 600*time.Millisecond)
 	fmt.Println("y")
 
-	// Step 1: Clone plugin.
 	info.Println("\n[1/4] Checking clone plugin...")
-	demoStep(ctx, 400*time.Millisecond)
-	yellow.Printf("  ✓ clone plugin active on %s\n", src)
-	yellow.Printf("  ✓ clone plugin active on %s\n", dst)
+	demoSleep(ctx, 400*time.Millisecond)
+	color.New(color.FgYellow).Printf("  ✓ clone plugin active on %s\n", src)
+	color.New(color.FgYellow).Printf("  ✓ clone plugin active on %s\n", dst)
 
-	// Step 2: Users.
 	info.Println("[2/4] Creating clone users...")
-	demoStep(ctx, 500*time.Millisecond)
-	yellow.Printf("  ✓ clone_user@10.0.0.2 created on %s (BACKUP_ADMIN)\n", src)
-	yellow.Printf("  ✓ clone_user@10.0.0.1 created on %s (CLONE_ADMIN)\n", dst)
+	demoSleep(ctx, 500*time.Millisecond)
+	color.New(color.FgYellow).Printf("  ✓ clone_user@10.0.0.2 created on %s (BACKUP_ADMIN)\n", src)
+	color.New(color.FgYellow).Printf("  ✓ clone_user@10.0.0.1 created on %s (CLONE_ADMIN)\n", dst)
 
-	// Step 3: Fake clone with progress bar.
 	info.Println("[3/4] Cloning...")
+	totalStart := time.Now()
 	if err := demoRunClone(ctx); err != nil {
 		return err
 	}
 
-	// Step 4: Fake restart.
 	info.Println("[4/4] Waiting for destination MySQL to restart...")
 	demoRestartWait(ctx, dst)
 
-	// Cleanup.
-	yellow.Println("\n  ✓ clone_user dropped on both servers")
-	yellow.Println("  ✓ clone plugin uninstalled")
+	info.Println("Verifying clone status...")
+	demoSleep(ctx, 300*time.Millisecond)
+	color.New(color.FgYellow).Println("  ✓ STATE = Completed")
+
+	total := time.Since(totalStart).Round(time.Second)
+	info.Printf("Total time: %s\n", formatDuration(total))
+
+	color.New(color.FgYellow).Println("\n  ✓ clone_user dropped on both servers")
+	color.New(color.FgYellow).Println("  ✓ clone plugin uninstalled")
 
 	info.Println("\nDone. Destination database is a fresh copy of source.")
 	return nil
 }
 
-// demoRunClone shows a fake clone progress bar over 15–30 seconds.
+// demoRunClone animates each clone stage on its own line, then prints a summary.
 func demoRunClone(ctx context.Context) error {
 	totalDuration := time.Duration(15+rand.IntN(16)) * time.Second
 	totalBytes := int64(40+rand.IntN(60)) * 1024 * 1024 * 1024 // 40–100 GB
 
-	stages := []struct {
+	type stageSpec struct {
 		name    string
-		portion float64 // fraction of total time
-	}{
-		{"DROP DATA", 0.05},
-		{"FILE COPY", 0.78},
-		{"PAGE COPY", 0.08},
-		{"REDO COPY", 0.05},
-		{"FILE SYNC", 0.04},
+		portion float64 // fraction of totalDuration
+		hasData bool
+	}
+	stages := []stageSpec{
+		{"DROP DATA", 0.05, false},
+		{"FILE COPY", 0.78, true},
+		{"PAGE COPY", 0.08, false},
+		{"REDO COPY", 0.05, false},
+		{"FILE SYNC", 0.04, false},
 	}
 
-	bar := progress.NewSpinner("Cloning [DROP DATA]")
-	bar.SetTotal(totalBytes)
+	spinChars := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	spinIdx := 0
+	green := color.New(color.FgGreen)
 
-	start := time.Now()
-	stageStart := start
-	stageIdx := 0
-	var stageBytesStart int64
+	type doneStage struct {
+		name  string
+		dur   time.Duration
+		bytes int64
+	}
+	var completed []doneStage
 
-	ticker := time.NewTicker(150 * time.Millisecond)
-	defer ticker.Stop()
+	overallStart := time.Now()
 
-	for {
-		select {
-		case <-ctx.Done():
-			bar.Finish()
-			return ctx.Err()
-		case <-ticker.C:
-			elapsed := time.Since(start)
-			if elapsed >= totalDuration {
-				bar.SetCurrent(totalBytes)
-				bar.Finish()
-				elapsed = elapsed.Round(time.Second)
-				color.New(color.FgGreen).Printf("Clone completed in %s\n", formatDuration(elapsed))
-				return nil
+	for _, stage := range stages {
+		stageDur := time.Duration(float64(totalDuration) * stage.portion)
+		stageStart := time.Now()
+		ticker := time.NewTicker(120 * time.Millisecond)
+
+	stageLoop:
+		for {
+			select {
+			case <-ctx.Done():
+				ticker.Stop()
+				fmt.Fprintln(os.Stderr)
+				return ctx.Err()
+
+			case now := <-ticker.C:
+				elapsed := now.Sub(stageStart)
+				if elapsed >= stageDur {
+					ticker.Stop()
+					break stageLoop
+				}
+
+				spin := spinChars[spinIdx%len(spinChars)]
+				spinIdx++
+
+				extra := ""
+				if stage.hasData {
+					progress := float64(elapsed) / float64(stageDur)
+					transferred := int64(float64(totalBytes) * progress)
+					extra = fmt.Sprintf("  %s / %s  %.0f%%",
+						demoBytesStr(transferred), demoBytesStr(totalBytes), progress*100)
+				}
+				elapsedStr := demoDurStr(elapsed.Round(time.Second))
+				fmt.Fprintf(os.Stderr, "\r  %s %-12s  %-8s%s    ",
+					spin, stage.name, elapsedStr, extra)
 			}
+		}
 
-			// Advance through stages.
-			stageFraction := stages[stageIdx].portion
-			stageElapsed := time.Since(stageStart)
-			stageDuration := time.Duration(float64(totalDuration) * stageFraction)
+		// Print completed stage.
+		dur := time.Since(stageStart).Round(time.Second)
+		fmt.Fprintf(os.Stderr, "\r\033[K")
 
-			if stageElapsed >= stageDuration && stageIdx < len(stages)-1 {
-				stageIdx++
-				stageStart = time.Now()
-				stageBytesStart = int64(float64(totalBytes) * elapsedFraction(start, totalDuration))
-			}
+		var bytesVal int64
+		if stage.hasData {
+			bytesVal = totalBytes
+			green.Fprintf(os.Stderr, "  ✓ %-12s  %-10s  %s\n",
+				stage.name, demoDurStr(dur), demoBytesStr(bytesVal))
+		} else {
+			green.Fprintf(os.Stderr, "  ✓ %-12s  %s\n",
+				stage.name, demoDurStr(dur))
+		}
 
-			current := int64(float64(totalBytes) * elapsedFraction(start, totalDuration))
-			// Add jitter so the bar doesn't move perfectly linearly.
-			jitter := rand.Int64N(int64(50*time.Millisecond)) - int64(25*time.Millisecond)
-			current += jitter * int64(totalBytes) / int64(totalDuration)
-			if current < stageBytesStart {
-				current = stageBytesStart
-			}
-			if current > totalBytes {
-				current = totalBytes
-			}
+		completed = append(completed, doneStage{stage.name, dur, bytesVal})
+	}
 
-			bar.SetDescription(fmt.Sprintf("Cloning [%s]", stages[stageIdx].name))
-			bar.SetTotal(totalBytes)
-			bar.SetCurrent(current)
+	// Stage breakdown summary (mirrors real clone output).
+	fmt.Fprintln(os.Stderr, "\n  Stage breakdown:")
+	for _, s := range completed {
+		if s.bytes > 0 {
+			fmt.Fprintf(os.Stderr, "  %-14s  %-10s  %s\n",
+				s.name, demoDurStr(s.dur), demoBytesStr(s.bytes))
+		} else {
+			fmt.Fprintf(os.Stderr, "  %-14s  %s\n",
+				s.name, demoDurStr(s.dur))
 		}
 	}
+	fmt.Fprintln(os.Stderr)
+
+	_ = time.Since(overallStart) // available if needed
+	return nil
 }
 
-func elapsedFraction(start time.Time, total time.Duration) float64 {
-	f := time.Since(start).Seconds() / total.Seconds()
-	if f > 1 {
-		return 1
-	}
-	return f
-}
-
-// demoRestartWait simulates MySQL restart with countdown.
+// demoRestartWait simulates MySQL restart sequence.
 func demoRestartWait(ctx context.Context, host string) {
 	yellow := color.New(color.FgYellow)
 	steps := []struct {
 		delay time.Duration
 		msg   string
 	}{
-		{800 * time.Millisecond, "MySQL on " + host + " is shutting down..."},
-		{1200 * time.Millisecond, "Waiting for restart..."},
-		{1500 * time.Millisecond, "Waiting for restart... (2)"},
+		{700 * time.Millisecond, "MySQL on " + host + " is shutting down..."},
+		{1100 * time.Millisecond, "Waiting for restart..."},
+		{1400 * time.Millisecond, "Waiting for restart... (2)"},
 		{900 * time.Millisecond, "MySQL is back online ✓"},
 	}
 	for _, s := range steps {
@@ -164,7 +186,7 @@ func demoRestartWait(ctx context.Context, host string) {
 	}
 }
 
-// demoSwitch simulates the replication setup.
+// demoSwitch simulates the replication setup workflow.
 func demoSwitch(ctx context.Context, src, dst string) error {
 	info := color.New(color.FgGreen)
 	yellow := color.New(color.FgYellow)
@@ -176,27 +198,27 @@ func demoSwitch(ctx context.Context, src, dst string) error {
 	fmt.Println()
 	color.New(color.FgYellow).Printf("Replication: %s → %s\n\n", src, dst)
 	fmt.Print("Start replication? (Y/y to confirm): ")
-	time.Sleep(500 * time.Millisecond)
+	demoSleep(ctx, 500*time.Millisecond)
 	fmt.Println("y")
 
 	info.Println("\n[1/2] Creating replication user on source...")
-	demoStep(ctx, 600*time.Millisecond)
+	demoSleep(ctx, 600*time.Millisecond)
 	yellow.Printf("  ✓ %s@10.0.0.2 created on %s (REPLICATION SLAVE)\n", Cfg.ReplUser, src)
 
 	info.Println("[2/2] Configuring replication on destination...")
-	demoStep(ctx, 800*time.Millisecond)
-	yellow.Println("  ✓ STOP REPLICA")
-	demoStep(ctx, 200*time.Millisecond)
-	yellow.Println("  ✓ RESET REPLICA ALL")
-	demoStep(ctx, 300*time.Millisecond)
-	yellow.Printf("  ✓ CHANGE REPLICATION SOURCE TO SOURCE_HOST='10.0.0.1', SOURCE_AUTO_POSITION=1\n")
-	demoStep(ctx, 200*time.Millisecond)
-	yellow.Println("  ✓ START REPLICA")
+	for _, step := range []string{
+		"STOP REPLICA",
+		"RESET REPLICA ALL",
+		fmt.Sprintf("CHANGE REPLICATION SOURCE TO SOURCE_HOST='10.0.0.1', SOURCE_AUTO_POSITION=1"),
+		"START REPLICA",
+	} {
+		demoSleep(ctx, 250*time.Millisecond)
+		yellow.Printf("  ✓ %s\n", step)
+	}
 
 	info.Println("\nWaiting 10s for replication to start...")
-	demoStep(ctx, 2*time.Second) // only 2s in demo
+	demoSleep(ctx, 2*time.Second)
 
-	// Show fake healthy status.
 	fakeStatus := &mysqlpkg.ReplicaStatus{
 		Host:          dst,
 		SourceHost:    src,
@@ -217,18 +239,20 @@ func demoLag(hosts []string, asJSON bool) {
 
 	var results []lagResult
 	for _, h := range hosts {
-		lag := rand.IntN(5) // 0–4 seconds lag
-		s := &mysqlpkg.ReplicaStatus{
-			Host:          h,
-			SourceHost:    "master.demo.local",
-			SourcePort:    strconv.Itoa(Cfg.Port),
-			IORunning:     "Yes",
-			SQLRunning:    "Yes",
-			SecondsBehind: strconv.Itoa(lag),
-			IOState:       "Waiting for source to send event",
-			IsConfigured:  true,
-		}
-		results = append(results, lagResult{host: h, status: s})
+		lag := rand.IntN(5)
+		results = append(results, lagResult{
+			host: h,
+			status: &mysqlpkg.ReplicaStatus{
+				Host:          h,
+				SourceHost:    "master.demo.local",
+				SourcePort:    strconv.Itoa(Cfg.Port),
+				IORunning:     "Yes",
+				SQLRunning:    "Yes",
+				SecondsBehind: strconv.Itoa(lag),
+				IOState:       "Waiting for source to send event",
+				IsConfigured:  true,
+			},
+		})
 	}
 
 	if asJSON {
@@ -244,7 +268,7 @@ func demoLag(hosts []string, asJSON bool) {
 
 // demoLagWatch runs demoLag in watch mode with simulated lag drift.
 func demoLagWatch(ctx context.Context, hosts []string, interval time.Duration) {
-	lag := make([]int, len(hosts))
+	lags := make([]int, len(hosts))
 	for {
 		fmt.Print("\033[2J\033[H")
 		fmt.Printf("%s  mysqlctl lag  —  %s  (interval: %s)\n\n",
@@ -252,25 +276,26 @@ func demoLagWatch(ctx context.Context, hosts []string, interval time.Duration) {
 
 		var results []lagResult
 		for i, h := range hosts {
-			// Drift lag randomly: ±2 per tick, clamp 0–30.
-			lag[i] += rand.IntN(5) - 2
-			if lag[i] < 0 {
-				lag[i] = 0
+			lags[i] += rand.IntN(5) - 2
+			if lags[i] < 0 {
+				lags[i] = 0
 			}
-			if lag[i] > 30 {
-				lag[i] = 25
+			if lags[i] > 30 {
+				lags[i] = 25
 			}
-			s := &mysqlpkg.ReplicaStatus{
-				Host:          h,
-				SourceHost:    "master.demo.local",
-				SourcePort:    strconv.Itoa(Cfg.Port),
-				IORunning:     "Yes",
-				SQLRunning:    "Yes",
-				SecondsBehind: strconv.Itoa(lag[i]),
-				IOState:       "Waiting for source to send event",
-				IsConfigured:  true,
-			}
-			results = append(results, lagResult{host: h, status: s})
+			results = append(results, lagResult{
+				host: h,
+				status: &mysqlpkg.ReplicaStatus{
+					Host:          h,
+					SourceHost:    "master.demo.local",
+					SourcePort:    strconv.Itoa(Cfg.Port),
+					IORunning:     "Yes",
+					SQLRunning:    "Yes",
+					SecondsBehind: strconv.Itoa(lags[i]),
+					IOState:       "Waiting for source to send event",
+					IsConfigured:  true,
+				},
+			})
 		}
 
 		if len(hosts) == 1 {
@@ -287,9 +312,42 @@ func demoLagWatch(ctx context.Context, hosts []string, interval time.Duration) {
 	}
 }
 
-func demoStep(ctx context.Context, d time.Duration) {
+func demoSleep(ctx context.Context, d time.Duration) {
 	select {
 	case <-ctx.Done():
 	case <-time.After(d):
+	}
+}
+
+// demoDurStr formats a duration for demo display (same style as internal fmtDur).
+func demoDurStr(d time.Duration) string {
+	d = d.Round(time.Second)
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	m := int(d.Minutes())
+	s := int(d.Seconds()) % 60
+	if s == 0 {
+		return fmt.Sprintf("%dm", m)
+	}
+	return fmt.Sprintf("%dm%ds", m, s)
+}
+
+// demoBytesStr formats bytes for demo display.
+func demoBytesStr(b int64) string {
+	const (
+		_KB = 1024
+		_MB = 1024 * _KB
+		_GB = 1024 * _MB
+	)
+	switch {
+	case b >= _GB:
+		return fmt.Sprintf("%.1f GB", float64(b)/float64(_GB))
+	case b >= _MB:
+		return fmt.Sprintf("%.1f MB", float64(b)/float64(_MB))
+	case b >= _KB:
+		return fmt.Sprintf("%.1f KB", float64(b)/float64(_KB))
+	default:
+		return fmt.Sprintf("%d B", b)
 	}
 }

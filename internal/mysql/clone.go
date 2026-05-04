@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"strconv"
 	"time"
 
+	"github.com/fatih/color"
 	gmysql "github.com/go-sql-driver/mysql"
-	"github.com/local/mysqlctl/internal/progress"
 )
 
 // EnsureClonePlugin installs the clone plugin on c if it is not already active.
@@ -30,7 +31,6 @@ func EnsureClonePlugin(ctx context.Context, c *Client) error {
 }
 
 // CreateCloneUsers creates clone_user on src (BACKUP_ADMIN) and dst (CLONE_ADMIN).
-// sql_log_bin is disabled so the statements are not replicated.
 func CreateCloneUsers(ctx context.Context, src, dst *Client, srcIP, dstIP, clonePass string, dryRun bool) error {
 	srcStmts := []string{
 		"SET sql_log_bin=0",
@@ -62,8 +62,9 @@ func CreateCloneUsers(ctx context.Context, src, dst *Client, srcIP, dstIP, clone
 	return nil
 }
 
-// RunClone executes CLONE INSTANCE FROM on dst while showing live progress.
-// MySQL restarts automatically after the clone; a connection drop is treated as success.
+// RunClone executes CLONE INSTANCE FROM on dst with per-stage progress display.
+// Returns nil when the CLONE statement finishes (or connection drops due to restart).
+// After this returns, call WaitForMySQL + VerifyCloneStatus to confirm success.
 func RunClone(ctx context.Context, dst *Client, srcIP string, srcPort int, clonePass string, dryRun bool) error {
 	donorSQL := fmt.Sprintf("SET GLOBAL clone_valid_donor_list = '%s:%d'", srcIP, srcPort)
 	cloneSQL := fmt.Sprintf(
@@ -88,96 +89,108 @@ func RunClone(ctx context.Context, dst *Client, srcIP string, srcPort int, clone
 		cloneErrCh <- err
 	}()
 
-	// Give MySQL a moment to register the clone before we start polling.
+	// Give MySQL a moment before polling progress.
 	time.Sleep(2 * time.Second)
 
-	bar := progress.NewSpinner("Cloning...")
+	tracker := newCloneTracker()
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case err := <-cloneErrCh:
-			bar.Finish()
-			if isExpectedCloneError(err) {
-				slog.Info("clone statement returned (MySQL will restart)")
-				return nil
+			// Final refresh so we don't miss the last completed stage.
+			if rows, e := dst.QueryRows(context.Background(), cloneProgressQuery); e == nil {
+				tracker.update(rows)
 			}
-			return fmt.Errorf("clone: %w", err)
+			tracker.printSummary()
+
+			if err != nil {
+				var mysqlErr *gmysql.MySQLError
+				if errors.As(err, &mysqlErr) {
+					return fmt.Errorf("clone MySQL error %d: %s", mysqlErr.Number, mysqlErr.Message)
+				}
+				// Connection drop = MySQL restarted after clone. Not an error here;
+				// the caller must call WaitForMySQL + VerifyCloneStatus to confirm.
+				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+					slog.Info("clone connection dropped — MySQL is restarting")
+					return nil
+				}
+				// Any other non-MySQL error is also treated as an expected restart.
+				slog.Info("clone connection reset", "detail", err.Error())
+			}
+			return nil
 
 		case <-ticker.C:
-			updateProgress(dst, bar)
+			if rows, err := dst.QueryRows(context.Background(), cloneProgressQuery); err == nil {
+				tracker.update(rows)
+			}
 
 		case <-ctx.Done():
-			bar.Finish()
+			fmt.Fprintf(os.Stderr, "\r\033[K")
 			return ctx.Err()
 		}
 	}
 }
 
-func updateProgress(dst *Client, bar *progress.Bar) {
-	// Use a fresh background context so cancelling the main ctx doesn't stop polling.
-	ctx := context.Background()
-	rows, err := dst.QueryRows(ctx,
-		"SELECT STAGE, STATE, ESTIMATE, DATA_ELAPSED FROM performance_schema.clone_progress",
+// VerifyCloneStatus reconnects to dst and checks performance_schema.clone_status.
+// Returns nil if STATE = 'Completed', error if 'Failed', and logs a warning for anything else.
+func VerifyCloneStatus(ctx context.Context, c *Client) error {
+	m, err := c.QueryMap(ctx,
+		"SELECT STATE, ERROR_NO, ERROR_MESSAGE FROM performance_schema.clone_status ORDER BY ID DESC LIMIT 1",
 	)
-	if err != nil || len(rows) == 0 {
-		return
+	if err != nil || m == nil {
+		// clone_status unavailable (older MySQL, or table empty on first clone).
+		slog.Warn("cannot verify clone_status, assuming success", "err", err)
+		return nil
 	}
-
-	var totalEst, totalElp int64
-	var activeStage string
-	for _, row := range rows {
-		if row["STATE"] == "In Progress" {
-			activeStage = row["STAGE"]
+	switch m["STATE"] {
+	case "Completed", "":
+		return nil
+	case "Failed":
+		msg := m["ERROR_MESSAGE"]
+		if msg == "" {
+			msg = "error code " + m["ERROR_NO"]
 		}
-		if v, err := strconv.ParseInt(row["ESTIMATE"], 10, 64); err == nil {
-			totalEst += v
-		}
-		if v, err := strconv.ParseInt(row["DATA_ELAPSED"], 10, 64); err == nil {
-			totalElp += v
-		}
-	}
-
-	if activeStage != "" {
-		bar.SetDescription(fmt.Sprintf("Cloning [%s]", activeStage))
-	}
-	if totalEst > 0 {
-		bar.SetTotal(totalEst)
-		bar.SetCurrent(totalElp)
+		return fmt.Errorf("clone failed on server: %s", msg)
+	default:
+		slog.Warn("unexpected clone_status state", "state", m["STATE"])
+		return nil
 	}
 }
 
-// WaitForMySQL polls host:port until MySQL accepts connections or maxWait is exceeded.
-// Uses exponential backoff starting at 3s, capped at 30s.
+// WaitForMySQL polls host:port until MySQL accepts connections, with exponential backoff.
 func WaitForMySQL(host string, port int, user, pass string, maxWait time.Duration) error {
 	deadline := time.Now().Add(maxWait)
 	delay := 3 * time.Second
 
-	slog.Info("waiting for MySQL to restart", "host", host, "port", port)
+	slog.Info("waiting for MySQL to restart", "host", host)
+	attempt := 0
 	for time.Now().Before(deadline) {
 		time.Sleep(delay)
 		if delay < 30*time.Second {
 			delay = min(delay*2, 30*time.Second)
 		}
+		attempt++
 
 		cfg := Config{Host: host, Port: port, User: user, Password: pass, Timeout: 5 * time.Second}
 		c, err := NewClient(cfg)
 		if err != nil {
+			slog.Debug("reconnect attempt failed", "attempt", attempt, "err", err)
 			continue
 		}
 		pingErr := c.Ping(context.Background())
 		_ = c.Close()
 		if pingErr == nil {
-			slog.Info("MySQL is back", "host", host)
+			slog.Info("MySQL is back", "host", host, "attempts", attempt)
 			return nil
 		}
+		slog.Debug("ping failed", "attempt", attempt, "err", pingErr)
 	}
 	return fmt.Errorf("MySQL on %s:%d did not come back within %s", host, port, maxWait)
 }
 
 // CleanupClone drops clone_user and uninstalls the clone plugin on both servers.
-// Errors are logged but not returned — this is always best-effort.
 func CleanupClone(ctx context.Context, src, dst *Client, srcIP, dstIP string) {
 	srcStmts := []string{
 		"SET sql_log_bin=0",
@@ -200,22 +213,147 @@ func CleanupClone(ctx context.Context, src, dst *Client, srcIP, dstIP string) {
 	slog.Info("cleanup complete")
 }
 
-// isExpectedCloneError returns true when err is a network/connection error caused
-// by MySQL restarting after a successful clone (not an actual MySQL error).
-func isExpectedCloneError(err error) bool {
-	if err == nil {
-		return true
+// ── per-stage progress tracker ───────────────────────────────────────────────
+
+const cloneProgressQuery = `SELECT STAGE, STATE, BEGIN_TIME, END_TIME, ESTIMATE, DATA_ELAPSED
+FROM performance_schema.clone_progress`
+
+var spinChars = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+type stageResult struct {
+	name     string
+	duration time.Duration
+	bytes    int64
+}
+
+type cloneTracker struct {
+	printed   map[string]bool
+	results   []stageResult
+	spinIdx   int
+	stageSeen map[string]time.Time
+}
+
+func newCloneTracker() *cloneTracker {
+	return &cloneTracker{
+		printed:   make(map[string]bool),
+		stageSeen: make(map[string]time.Time),
 	}
-	var mysqlErr *gmysql.MySQLError
-	if errors.As(err, &mysqlErr) {
-		return false // genuine MySQL error — not expected
+}
+
+// update processes a fresh snapshot of clone_progress rows.
+func (t *cloneTracker) update(rows []map[string]string) {
+	green := color.New(color.FgGreen)
+
+	// Print newly completed stages first (preserving order from MySQL).
+	for _, row := range rows {
+		name := row["STAGE"]
+		if row["STATE"] == "Completed" && !t.printed[name] {
+			t.printed[name] = true
+			dur := parseStageDuration(row["BEGIN_TIME"], row["END_TIME"])
+			bytes, _ := strconv.ParseInt(row["DATA_ELAPSED"], 10, 64)
+			t.results = append(t.results, stageResult{name, dur, bytes})
+
+			fmt.Fprintf(os.Stderr, "\r\033[K") // erase spinner line
+			if bytes > 0 {
+				green.Fprintf(os.Stderr, "  ✓ %-12s  %-10s  %s\n",
+					name, fmtDur(dur), fmtBytes(bytes))
+			} else {
+				green.Fprintf(os.Stderr, "  ✓ %-12s  %s\n",
+					name, fmtDur(dur))
+			}
+		}
 	}
-	// io.EOF or net errors mean the connection was reset — MySQL restarted.
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
+
+	// Render spinner for current in-progress stage.
+	spin := spinChars[t.spinIdx%len(spinChars)]
+	t.spinIdx++
+
+	for _, row := range rows {
+		if row["STATE"] != "In Progress" {
+			continue
+		}
+		name := row["STAGE"]
+		if _, seen := t.stageSeen[name]; !seen {
+			t.stageSeen[name] = time.Now()
+		}
+		elapsed := time.Since(t.stageSeen[name]).Round(time.Second)
+
+		est, _ := strconv.ParseInt(row["ESTIMATE"], 10, 64)
+		elp, _ := strconv.ParseInt(row["DATA_ELAPSED"], 10, 64)
+
+		extra := ""
+		if est > 0 && elp > 0 {
+			extra = fmt.Sprintf("  %s / %s  %.0f%%",
+				fmtBytes(elp), fmtBytes(est), float64(elp)/float64(est)*100)
+		}
+
+		fmt.Fprintf(os.Stderr, "\r  %s %-12s  %-8s%s    ",
+			spin, name, fmtDur(elapsed), extra)
+		return
 	}
-	// Any other non-MySQL error is treated as an expected restart.
-	return true
+}
+
+// printSummary erases the spinner line and prints a per-stage breakdown.
+func (t *cloneTracker) printSummary() {
+	fmt.Fprintf(os.Stderr, "\r\033[K") // clear spinner line
+
+	if len(t.results) == 0 {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "\n  Stage breakdown:")
+	for _, s := range t.results {
+		if s.bytes > 0 {
+			fmt.Fprintf(os.Stderr, "  %-14s  %-10s  %s\n",
+				s.name, fmtDur(s.duration), fmtBytes(s.bytes))
+		} else {
+			fmt.Fprintf(os.Stderr, "  %-14s  %s\n",
+				s.name, fmtDur(s.duration))
+		}
+	}
+	fmt.Fprintln(os.Stderr)
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+func parseStageDuration(begin, end string) time.Duration {
+	const layout = "2006-01-02 15:04:05"
+	bt, err1 := time.Parse(layout, begin)
+	et, err2 := time.Parse(layout, end)
+	if err1 != nil || err2 != nil || end == "" {
+		return 0
+	}
+	return et.Sub(bt).Round(time.Second)
+}
+
+func fmtDur(d time.Duration) string {
+	d = d.Round(time.Second)
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	m := int(d.Minutes())
+	s := int(d.Seconds()) % 60
+	if s == 0 {
+		return fmt.Sprintf("%dm", m)
+	}
+	return fmt.Sprintf("%dm%ds", m, s)
+}
+
+func fmtBytes(b int64) string {
+	const (
+		_KB = 1024
+		_MB = 1024 * _KB
+		_GB = 1024 * _MB
+	)
+	switch {
+	case b >= _GB:
+		return fmt.Sprintf("%.1f GB", float64(b)/float64(_GB))
+	case b >= _MB:
+		return fmt.Sprintf("%.1f MB", float64(b)/float64(_MB))
+	case b >= _KB:
+		return fmt.Sprintf("%.1f KB", float64(b)/float64(_KB))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
 }
 
 func printDryRun(target string, stmts []string) {
