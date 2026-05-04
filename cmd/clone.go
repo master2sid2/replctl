@@ -18,8 +18,8 @@ var cloneCmd = &cobra.Command{
 	Use:   "clone",
 	Short: "Clone source database to destination using MySQL clone plugin",
 	Long: `Installs the clone plugin on both servers, creates temporary clone users,
-executes CLONE INSTANCE FROM (with live progress), waits for destination MySQL
-to restart, then cleans up all temporary users and plugins.`,
+executes CLONE INSTANCE FROM (with live per-stage progress), waits for destination
+MySQL to restart, verifies clone_status, then cleans up all temporary objects.`,
 	RunE: runClone,
 }
 
@@ -63,13 +63,12 @@ func runClone(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("resolve dst: %w", resolveErr[1])
 	}
 
-	connCfg := mysqlpkg.Config{User: Cfg.User, Password: Cfg.Password, Port: Cfg.Port, Timeout: 30 * time.Second}
-
 	var srcClient, dstClient *mysqlpkg.Client
 
 	if !Cfg.DryRun {
 		// Check connectivity to both servers in parallel.
 		var connErr [2]error
+		connCfg := mysqlpkg.Config{User: Cfg.User, Password: Cfg.Password, Port: Cfg.Port, Timeout: 30 * time.Second}
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
@@ -146,38 +145,50 @@ func runClone(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	// Step 3: Execute clone with live progress.
+	// Step 3: Execute CLONE with per-stage progress display.
+	// RunClone returns when the CLONE statement finishes or the connection drops
+	// (expected after MySQL auto-restart). Verification happens in step 4.
 	info.Println("[3/4] Cloning...")
-	start := time.Now()
+	totalStart := time.Now()
 	if err := mysqlpkg.RunClone(ctx, dstClient, srcIP, Cfg.Port, Cfg.ClonePassword, Cfg.DryRun); err != nil {
 		if !Cfg.DryRun {
 			mysqlpkg.CleanupClone(ctx, srcClient, dstClient, srcIP, dstIP)
 		}
 		return err
 	}
-	elapsed := time.Since(start).Round(time.Second)
-	info.Printf("Clone completed in %s\n", formatDuration(elapsed))
 
-	// Step 4: Wait for destination MySQL to restart.
+	// Step 4: Wait for MySQL restart + verify clone completed on server side.
+	// This is the key difference from the bash version: we confirm STATE='Completed'
+	// so a dropped connection mid-clone is never silently treated as success.
 	if !Cfg.DryRun {
 		info.Println("[4/4] Waiting for destination MySQL to restart...")
 		if err := mysqlpkg.WaitForMySQL(dst, Cfg.Port, Cfg.User, Cfg.Password, 5*time.Minute); err != nil {
 			return err
 		}
-		// Re-open dst connection after restart for cleanup.
-		dstClient.Close()
-		c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: dst, User: Cfg.User, Password: Cfg.Password, Port: Cfg.Port, Timeout: 30 * time.Second})
-		if err != nil {
-			return fmt.Errorf("reconnect dst after clone: %w", err)
-		}
-		dstClient = c
-		defer dstClient.Close()
-	}
 
-	if !Cfg.DryRun {
+		// Re-open connection to the now-restarted dst.
+		dstClient.Close()
+		fresh, err := mysqlpkg.NewClient(mysqlpkg.Config{
+			Host: dst, User: Cfg.User, Password: Cfg.Password,
+			Port: Cfg.Port, Timeout: 30 * time.Second,
+		})
+		if err != nil {
+			return fmt.Errorf("reconnect dst after restart: %w", err)
+		}
+		dstClient = fresh
+		defer dstClient.Close()
+
+		// Verify the clone actually completed (protects against dropped connections).
+		info.Println("Verifying clone status...")
+		if err := mysqlpkg.VerifyCloneStatus(ctx, dstClient); err != nil {
+			return err
+		}
+
+		total := time.Since(totalStart).Round(time.Second)
+		info.Printf("Total time: %s\n", formatDuration(total))
+
 		mysqlpkg.CleanupClone(ctx, srcClient, dstClient, srcIP, dstIP)
 	}
-
 
 	info.Println("\nDone. Destination database is a fresh copy of source.")
 	return nil
