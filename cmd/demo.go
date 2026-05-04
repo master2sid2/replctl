@@ -85,14 +85,6 @@ func demoRunClone(ctx context.Context) error {
 	spinIdx := 0
 	green := color.New(color.FgGreen)
 
-	type doneStage struct {
-		name  string
-		dur   time.Duration
-		bytes int64
-	}
-	var completed []doneStage
-
-	overallStart := time.Now()
 
 	for _, stage := range stages {
 		stageDur := time.Duration(float64(totalDuration) * stage.portion)
@@ -144,23 +136,8 @@ func demoRunClone(ctx context.Context) error {
 				stage.name, demoDurStr(dur))
 		}
 
-		completed = append(completed, doneStage{stage.name, dur, bytesVal})
 	}
 
-	// Stage breakdown summary (mirrors real clone output).
-	fmt.Fprintln(os.Stderr, "\n  Stage breakdown:")
-	for _, s := range completed {
-		if s.bytes > 0 {
-			fmt.Fprintf(os.Stderr, "  %-14s  %-10s  %s\n",
-				s.name, demoDurStr(s.dur), demoBytesStr(s.bytes))
-		} else {
-			fmt.Fprintf(os.Stderr, "  %-14s  %s\n",
-				s.name, demoDurStr(s.dur))
-		}
-	}
-	fmt.Fprintln(os.Stderr)
-
-	_ = time.Since(overallStart) // available if needed
 	return nil
 }
 
