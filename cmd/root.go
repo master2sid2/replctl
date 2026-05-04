@@ -27,6 +27,7 @@ var Cfg struct {
 	DryRun        bool
 	JSON          bool
 	Verbose       bool
+	Demo          bool
 }
 
 var rootCmd = &cobra.Command{
@@ -75,6 +76,7 @@ func init() {
 	pf.BoolVar(&Cfg.DryRun, "dry-run", false, "print SQL without executing")
 	pf.BoolVar(&Cfg.JSON, "json", false, "output results as JSON")
 	pf.BoolVarP(&Cfg.Verbose, "verbose", "v", false, "enable debug logging")
+	pf.BoolVar(&Cfg.Demo, "demo", false, "demo mode: simulate all operations without real MySQL")
 
 	_ = viper.BindPFlag("port", pf.Lookup("port"))
 	_ = viper.BindPFlag("mysql_user", pf.Lookup("user"))

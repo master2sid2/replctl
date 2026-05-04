@@ -38,6 +38,10 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("source and destination must be different hosts")
 	}
 
+	if Cfg.Demo {
+		return demoSwitch(ctx, Cfg.Src, dst)
+	}
+
 	// Prompt for passwords if not set via flag or config.
 	if err := askPassword(&Cfg.Password, "MySQL password ("+Cfg.User+")"); err != nil {
 		return err
