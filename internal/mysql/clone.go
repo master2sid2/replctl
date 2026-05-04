@@ -103,7 +103,7 @@ func RunClone(ctx context.Context, dst *Client, srcIP string, srcPort int, clone
 			if rows, e := dst.QueryRows(context.Background(), cloneProgressQuery); e == nil {
 				tracker.update(rows)
 			}
-			tracker.printSummary()
+			fmt.Fprintf(os.Stderr, "\r\033[K") // clear spinner line
 
 			if err != nil {
 				var mysqlErr *gmysql.MySQLError
@@ -220,15 +220,8 @@ FROM performance_schema.clone_progress`
 
 var spinChars = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
-type stageResult struct {
-	name     string
-	duration time.Duration
-	bytes    int64
-}
-
 type cloneTracker struct {
 	printed   map[string]bool
-	results   []stageResult
 	spinIdx   int
 	stageSeen map[string]time.Time
 }
@@ -251,7 +244,6 @@ func (t *cloneTracker) update(rows []map[string]string) {
 			t.printed[name] = true
 			dur := parseStageDuration(row["BEGIN_TIME"], row["END_TIME"])
 			bytes, _ := strconv.ParseInt(row["DATA_ELAPSED"], 10, 64)
-			t.results = append(t.results, stageResult{name, dur, bytes})
 
 			fmt.Fprintf(os.Stderr, "\r\033[K") // erase spinner line
 			if bytes > 0 {
@@ -291,26 +283,6 @@ func (t *cloneTracker) update(rows []map[string]string) {
 			spin, name, fmtDur(elapsed), extra)
 		return
 	}
-}
-
-// printSummary erases the spinner line and prints a per-stage breakdown.
-func (t *cloneTracker) printSummary() {
-	fmt.Fprintf(os.Stderr, "\r\033[K") // clear spinner line
-
-	if len(t.results) == 0 {
-		return
-	}
-	fmt.Fprintln(os.Stderr, "\n  Stage breakdown:")
-	for _, s := range t.results {
-		if s.bytes > 0 {
-			fmt.Fprintf(os.Stderr, "  %-14s  %-10s  %s\n",
-				s.name, fmtDur(s.duration), fmtBytes(s.bytes))
-		} else {
-			fmt.Fprintf(os.Stderr, "  %-14s  %s\n",
-				s.name, fmtDur(s.duration))
-		}
-	}
-	fmt.Fprintln(os.Stderr)
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
