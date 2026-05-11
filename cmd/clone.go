@@ -72,11 +72,10 @@ func runClone(cmd *cobra.Command, _ []string) error {
 	if !Cfg.DryRun {
 		// Check connectivity to both servers in parallel.
 		var connErr [2]error
-		connCfg := mysqlpkg.Config{User: Cfg.User, Password: Cfg.Password, Port: Cfg.Port, Timeout: 30 * time.Second}
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: Cfg.Src, User: connCfg.User, Password: connCfg.Password, Port: connCfg.Port, Timeout: connCfg.Timeout})
+			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: Cfg.Src, User: Cfg.User, Password: Cfg.Password, Port: srcPort(), Timeout: 30 * time.Second})
 			if err != nil {
 				connErr[0] = err
 				return
@@ -90,7 +89,7 @@ func runClone(cmd *cobra.Command, _ []string) error {
 		}()
 		go func() {
 			defer wg.Done()
-			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: dst, User: connCfg.User, Password: connCfg.Password, Port: connCfg.Port, Timeout: connCfg.Timeout})
+			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: dst, User: Cfg.User, Password: Cfg.Password, Port: dstPort(), Timeout: 30 * time.Second})
 			if err != nil {
 				connErr[1] = err
 				return
@@ -154,7 +153,7 @@ func runClone(cmd *cobra.Command, _ []string) error {
 	// (expected after MySQL auto-restart). Verification happens in step 4.
 	info.Println("[3/4] Cloning...")
 	totalStart := time.Now()
-	if err := mysqlpkg.RunClone(ctx, dstClient, srcIP, Cfg.Port, Cfg.ClonePassword, Cfg.DryRun); err != nil {
+	if err := mysqlpkg.RunClone(ctx, dstClient, srcIP, srcPort(), Cfg.ClonePassword, Cfg.DryRun); err != nil {
 		if !Cfg.DryRun {
 			mysqlpkg.CleanupClone(ctx, srcClient, dstClient, srcIP, dstIP)
 		}
@@ -166,7 +165,7 @@ func runClone(cmd *cobra.Command, _ []string) error {
 	// so a dropped connection mid-clone is never silently treated as success.
 	if !Cfg.DryRun {
 		info.Println("[4/4] Waiting for destination MySQL to restart...")
-		if err := mysqlpkg.WaitForMySQL(dst, Cfg.Port, Cfg.User, Cfg.Password, 5*time.Minute); err != nil {
+		if err := mysqlpkg.WaitForMySQL(dst, dstPort(), Cfg.User, Cfg.Password, 5*time.Minute); err != nil {
 			return err
 		}
 
@@ -174,7 +173,7 @@ func runClone(cmd *cobra.Command, _ []string) error {
 		dstClient.Close()
 		fresh, err := mysqlpkg.NewClient(mysqlpkg.Config{
 			Host: dst, User: Cfg.User, Password: Cfg.Password,
-			Port: Cfg.Port, Timeout: 30 * time.Second,
+			Port: dstPort(), Timeout: 30 * time.Second,
 		})
 		if err != nil {
 			return fmt.Errorf("reconnect dst after restart: %w", err)

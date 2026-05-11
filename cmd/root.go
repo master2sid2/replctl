@@ -18,6 +18,8 @@ var Cfg struct {
 	Src           string
 	Dst           []string
 	Port          int
+	SrcPort       int
+	DstPort       int
 	User          string
 	Password      string
 	ClonePassword string
@@ -28,6 +30,24 @@ var Cfg struct {
 	JSON          bool
 	Verbose       bool
 	Demo          bool
+}
+
+// srcPort returns the MySQL port for the source host.
+// --src-port overrides --port when set.
+func srcPort() int {
+	if Cfg.SrcPort != 0 {
+		return Cfg.SrcPort
+	}
+	return Cfg.Port
+}
+
+// dstPort returns the MySQL port for destination host(s).
+// --dst-port overrides --port when set.
+func dstPort() int {
+	if Cfg.DstPort != 0 {
+		return Cfg.DstPort
+	}
+	return Cfg.Port
 }
 
 var rootCmd = &cobra.Command{
@@ -66,7 +86,9 @@ func init() {
 
 	pf.StringVarP(&Cfg.Src, "src", "s", "", "source MySQL host (IP or FQDN)")
 	pf.StringArrayVarP(&Cfg.Dst, "dst", "d", nil, "destination host(s); repeat or comma-separate for multi-host lag")
-	pf.IntVar(&Cfg.Port, "port", 3306, "MySQL port")
+	pf.IntVar(&Cfg.Port, "port", 3306, "MySQL port (default for both src and dst)")
+	pf.IntVar(&Cfg.SrcPort, "src-port", 0, "source MySQL port (overrides --port)")
+	pf.IntVar(&Cfg.DstPort, "dst-port", 0, "destination MySQL port (overrides --port)")
 	pf.StringVarP(&Cfg.User, "user", "u", "root", "MySQL user")
 	pf.StringVarP(&Cfg.Password, "password", "p", "", "MySQL password")
 	pf.StringVar(&Cfg.ClonePassword, "clone-password", "", "clone_user password")
