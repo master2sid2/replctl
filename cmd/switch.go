@@ -69,7 +69,7 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: Cfg.Src, User: Cfg.User, Password: Cfg.Password, Port: Cfg.Port, Timeout: 30 * time.Second})
+			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: Cfg.Src, User: Cfg.User, Password: Cfg.Password, Port: srcPort(), Timeout: 30 * time.Second})
 			if err != nil {
 				connErr[0] = err
 				return
@@ -83,7 +83,7 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 		}()
 		go func() {
 			defer wg.Done()
-			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: dst, User: Cfg.User, Password: Cfg.Password, Port: Cfg.Port, Timeout: 30 * time.Second})
+			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: dst, User: Cfg.User, Password: Cfg.Password, Port: dstPort(), Timeout: 30 * time.Second})
 			if err != nil {
 				connErr[1] = err
 				return
@@ -133,7 +133,7 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 
 	// Step 2: Configure replication on destination.
 	info.Println("[2/2] Configuring replication on destination...")
-	if err := mysqlpkg.ConfigureReplication(ctx, dstClient, srcIP, Cfg.Port, Cfg.ReplUser, Cfg.ReplPassword, Cfg.DryRun); err != nil {
+	if err := mysqlpkg.ConfigureReplication(ctx, dstClient, srcIP, srcPort(), Cfg.ReplUser, Cfg.ReplPassword, Cfg.DryRun); err != nil {
 		return fmt.Errorf("configure replication: %w", err)
 	}
 

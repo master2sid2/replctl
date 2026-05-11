@@ -99,7 +99,7 @@ func printLagForHosts(ctx context.Context, hosts []string) {
 			defer cancel()
 			c, err := mysqlpkg.NewClient(mysqlpkg.Config{
 				Host:     host,
-				Port:     Cfg.Port,
+				Port:     dstPort(),
 				User:     Cfg.User,
 				Password: Cfg.Password,
 				Timeout:  10 * time.Second,
