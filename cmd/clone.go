@@ -185,7 +185,7 @@ func runClone(cmd *cobra.Command, _ []string) error {
 	// This is the key difference from the bash version: we confirm STATE='Completed'
 	// so a dropped connection mid-clone is never silently treated as success.
 	if !Cfg.DryRun {
-		info.Println("[4/4] Restarting...")
+		info.Println("[4/4] Waiting for destination MySQL to restart...")
 		if err := mysqlpkg.WaitForMySQL(dst, dstPort(), dstUser(), dstPassword(), 5*time.Minute); err != nil {
 			return err
 		}

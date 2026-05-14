@@ -86,7 +86,7 @@ func CreateReplUser(ctx context.Context, src *Client, dstIP, replUser, replPass 
 	if err := src.ExecSession(ctx, stmts); err != nil {
 		return err
 	}
-	color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ replication user '%s'@'%s' created on %s\n", replUser, dstIP, src.Host())
+	color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ %s@%s created on %s (REPLICATION SLAVE)\n", replUser, dstIP, src.Host())
 	return nil
 }
 

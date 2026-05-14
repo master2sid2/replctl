@@ -175,7 +175,7 @@ func WaitForMySQL(host string, port int, user, pass string, maxWait time.Duratio
 	deadline := time.Now().Add(maxWait)
 	delay := 3 * time.Second
 
-	fmt.Fprintf(os.Stderr, "  waiting for MySQL on %s to restart", host)
+	yellow := color.New(color.FgYellow)
 	attempt := 0
 	for time.Now().Before(deadline) {
 		time.Sleep(delay)
@@ -183,7 +183,15 @@ func WaitForMySQL(host string, port int, user, pass string, maxWait time.Duratio
 			delay = min(delay*2, 30*time.Second)
 		}
 		attempt++
-		fmt.Fprintf(os.Stderr, ".")
+
+		switch attempt {
+		case 1:
+			fmt.Fprintf(os.Stderr, "  MySQL on %s is shutting down...\n", host)
+		case 2:
+			fmt.Fprintf(os.Stderr, "  Waiting for restart...\n")
+		default:
+			fmt.Fprintf(os.Stderr, "  Waiting for restart... (%d)\n", attempt-1)
+		}
 
 		cfg := Config{Host: host, Port: port, User: user, Password: pass, Timeout: 5 * time.Second}
 		c, err := NewClient(cfg)
@@ -194,7 +202,7 @@ func WaitForMySQL(host string, port int, user, pass string, maxWait time.Duratio
 		pingErr := c.Ping(context.Background())
 		_ = c.Close()
 		if pingErr == nil {
-			color.New(color.FgYellow).Fprintf(os.Stderr, " ✓\n")
+			yellow.Fprintf(os.Stderr, "  MySQL is back online ✓\n")
 			return nil
 		}
 		slog.Debug("ping failed", "attempt", attempt, "err", pingErr)
@@ -228,7 +236,8 @@ func CleanupClone(ctx context.Context, src, dst *Client, srcIP, dstIP string) {
 	if err := dst.ExecSession(ctx, dstStmts); err != nil {
 		slog.Warn("cleanup on dst", "err", err)
 	}
-	color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ clone_user dropped, clone plugin uninstalled\n")
+	color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ clone_user dropped on both servers\n")
+	color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ clone plugin uninstalled\n")
 }
 
 // ── per-stage progress tracker ───────────────────────────────────────────────
