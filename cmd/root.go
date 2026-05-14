@@ -78,48 +78,6 @@ func dstPassword() string {
 	return Cfg.Password
 }
 
-func srcPort() int {
-	if Cfg.SrcPort != 0 {
-		return Cfg.SrcPort
-	}
-	return Cfg.Port
-}
-
-func dstPort() int {
-	if Cfg.DstPort != 0 {
-		return Cfg.DstPort
-	}
-	return Cfg.Port
-}
-
-func srcUser() string {
-	if Cfg.SrcUser != "" {
-		return Cfg.SrcUser
-	}
-	return Cfg.User
-}
-
-func dstUser() string {
-	if Cfg.DstUser != "" {
-		return Cfg.DstUser
-	}
-	return Cfg.User
-}
-
-func srcPassword() string {
-	if Cfg.SrcPassword != "" {
-		return Cfg.SrcPassword
-	}
-	return Cfg.Password
-}
-
-func dstPassword() string {
-	if Cfg.DstPassword != "" {
-		return Cfg.DstPassword
-	}
-	return Cfg.Password
-}
-
 var rootCmd = &cobra.Command{
 	Use:   "mysqlctl",
 	Short: "MySQL clone and replication management tool",
