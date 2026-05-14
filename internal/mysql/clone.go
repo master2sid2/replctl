@@ -16,21 +16,22 @@ import (
 
 // EnsureClonePlugin installs the clone plugin on c if it is not already active.
 func EnsureClonePlugin(ctx context.Context, c *Client) error {
-	m, err := c.QueryMap(ctx,
-		"SELECT PLUGIN_STATUS FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME='clone'",
-	)
+	const q = "SELECT PLUGIN_STATUS FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME='clone'"
+	slog.Debug(q, "host", c.Host())
+	m, err := c.QueryMap(ctx, q)
 	if err != nil {
 		return fmt.Errorf("check clone plugin on %s: %w", c.Host(), err)
 	}
 	if m != nil && m["PLUGIN_STATUS"] == "ACTIVE" {
-		color.New(color.FgGreen).Fprintf(os.Stderr, "  ✓ clone plugin already active on %s\n", c.Host())
+		color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ clone plugin active on %s\n", c.Host())
 		return nil
 	}
 	fmt.Fprintf(os.Stderr, "  installing clone plugin on %s...\n", c.Host())
+	slog.Debug("INSTALL PLUGIN clone SONAME 'mysql_clone.so'", "host", c.Host())
 	if err := c.ExecOne(ctx, "INSTALL PLUGIN clone SONAME 'mysql_clone.so'"); err != nil {
 		return err
 	}
-	color.New(color.FgGreen).Fprintf(os.Stderr, "  ✓ clone plugin installed on %s\n", c.Host())
+	color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ clone plugin installed on %s\n", c.Host())
 	return nil
 }
 
@@ -55,14 +56,21 @@ func CreateCloneUsers(ctx context.Context, src, dst *Client, srcIP, dstIP, clone
 		return nil
 	}
 
+	for _, s := range srcStmts {
+		slog.Debug(s, "host", src.Host())
+	}
 	if err := src.ExecSession(ctx, srcStmts); err != nil {
 		return fmt.Errorf("clone_user on src: %w", err)
 	}
-	color.New(color.FgGreen).Fprintf(os.Stderr, "  ✓ clone_user@%s created on %s (BACKUP_ADMIN)\n", dstIP, src.Host())
+	color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ clone_user@%s created on %s (BACKUP_ADMIN)\n", dstIP, src.Host())
+
+	for _, s := range dstStmts {
+		slog.Debug(s, "host", dst.Host())
+	}
 	if err := dst.ExecSession(ctx, dstStmts); err != nil {
 		return fmt.Errorf("clone_user on dst: %w", err)
 	}
-	color.New(color.FgGreen).Fprintf(os.Stderr, "  ✓ clone_user@%s created on %s (CLONE_ADMIN)\n", srcIP, dst.Host())
+	color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ clone_user@%s created on %s (CLONE_ADMIN)\n", srcIP, dst.Host())
 	return nil
 }
 
@@ -81,10 +89,11 @@ func RunClone(ctx context.Context, dst *Client, srcIP string, srcPort int, clone
 		return nil
 	}
 
+	slog.Debug(donorSQL, "host", dst.Host())
 	if err := dst.ExecOne(ctx, donorSQL); err != nil {
 		return fmt.Errorf("set clone donor list: %w", err)
 	}
-
+	slog.Debug(cloneSQL, "host", dst.Host())
 	fmt.Fprintf(os.Stderr, "  cloning from %s:%d → %s...\n", srcIP, srcPort, dst.Host())
 
 	cloneErrCh := make(chan error, 1)
@@ -150,7 +159,7 @@ func VerifyCloneStatus(ctx context.Context, c *Client) error {
 	}
 	switch m["STATE"] {
 	case "Completed", "":
-		color.New(color.FgGreen).Fprintf(os.Stderr, "  ✓ STATE = Completed\n")
+		color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ STATE = Completed\n")
 		return nil
 	case "Failed":
 		msg := m["ERROR_MESSAGE"]
@@ -188,7 +197,7 @@ func WaitForMySQL(host string, port int, user, pass string, maxWait time.Duratio
 		pingErr := c.Ping(context.Background())
 		_ = c.Close()
 		if pingErr == nil {
-			color.New(color.FgGreen).Fprintf(os.Stderr, " ✓\n")
+			color.New(color.FgYellow).Fprintf(os.Stderr, " ✓\n")
 			return nil
 		}
 		slog.Debug("ping failed", "attempt", attempt, "err", pingErr)
@@ -210,13 +219,19 @@ func CleanupClone(ctx context.Context, src, dst *Client, srcIP, dstIP string) {
 		"UNINSTALL PLUGIN clone",
 		"SET sql_log_bin=1",
 	}
+	for _, s := range srcStmts {
+		slog.Debug(s, "host", src.Host())
+	}
 	if err := src.ExecSession(ctx, srcStmts); err != nil {
 		slog.Warn("cleanup on src", "err", err)
+	}
+	for _, s := range dstStmts {
+		slog.Debug(s, "host", dst.Host())
 	}
 	if err := dst.ExecSession(ctx, dstStmts); err != nil {
 		slog.Warn("cleanup on dst", "err", err)
 	}
-	color.New(color.FgGreen).Fprintf(os.Stderr, "  ✓ clone_user dropped, clone plugin uninstalled\n")
+	color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ clone_user dropped, clone plugin uninstalled\n")
 }
 
 // ── per-stage progress tracker ───────────────────────────────────────────────
