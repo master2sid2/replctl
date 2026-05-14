@@ -92,7 +92,6 @@ func RunClone(ctx context.Context, dst *Client, srcIP string, srcPort int, clone
 		return fmt.Errorf("set clone donor list: %w", err)
 	}
 	slog.Debug(cloneSQL, "host", dst.Host())
-	fmt.Fprintf(os.Stderr, "  cloning from %s:%d → %s...\n", srcIP, srcPort, dst.Host())
 
 	cloneErrCh := make(chan error, 1)
 	go func() {

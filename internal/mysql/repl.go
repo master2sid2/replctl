@@ -92,27 +92,38 @@ func CreateReplUser(ctx context.Context, src *Client, dstIP, replUser, replPass 
 
 // ConfigureReplication runs CHANGE REPLICATION SOURCE TO on dst with GTID auto-position.
 func ConfigureReplication(ctx context.Context, dst *Client, srcIP string, srcPort int, replUser, replPass string, dryRun bool) error {
-	stmts := []string{
-		"STOP REPLICA",
-		"RESET REPLICA ALL",
-		fmt.Sprintf(
-			"CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', SOURCE_AUTO_POSITION=1",
-			srcIP, srcPort, replUser, replPass,
-		),
-		"START REPLICA",
+	changeStmt := fmt.Sprintf(
+		"CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', SOURCE_AUTO_POSITION=1",
+		srcIP, srcPort, replUser, replPass,
+	)
+	// Display label omits the password.
+	changeLabel := fmt.Sprintf(
+		"CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_AUTO_POSITION=1",
+		srcIP,
+	)
+	type step struct{ sql, label string }
+	steps := []step{
+		{"STOP REPLICA", "STOP REPLICA"},
+		{"RESET REPLICA ALL", "RESET REPLICA ALL"},
+		{changeStmt, changeLabel},
+		{"START REPLICA", "START REPLICA"},
 	}
 	if dryRun {
+		stmts := make([]string, len(steps))
+		for i, s := range steps {
+			stmts[i] = s.sql
+		}
 		printDryRun(fmt.Sprintf("DST (← %s:%d)", srcIP, srcPort), stmts)
 		return nil
 	}
-	// Each statement on its own call (STOP/START REPLICA don't need session state).
-	for _, stmt := range stmts {
-		slog.Debug(stmt, "host", dst.Host())
-		if err := dst.ExecOne(ctx, stmt); err != nil {
-			return fmt.Errorf("%q on %s: %w", stmt, dst.Host(), err)
+	yellow := color.New(color.FgYellow)
+	for _, s := range steps {
+		slog.Debug(s.sql, "host", dst.Host())
+		if err := dst.ExecOne(ctx, s.sql); err != nil {
+			return fmt.Errorf("%q on %s: %w", s.sql, dst.Host(), err)
 		}
+		yellow.Fprintf(os.Stderr, "  ✓ %s\n", s.label)
 	}
-	color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ replication configured on %s → %s:%d\n", dst.Host(), srcIP, srcPort)
 	return nil
 }
 
