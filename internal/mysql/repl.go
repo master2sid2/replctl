@@ -3,8 +3,10 @@ package mysql
 import (
 	"context"
 	"fmt"
-	"log/slog"
+	"os"
 	"strconv"
+
+	"github.com/fatih/color"
 )
 
 // ReplicaStatus holds parsed output of SHOW REPLICA STATUS.
@@ -77,8 +79,11 @@ func CreateReplUser(ctx context.Context, src *Client, dstIP, replUser, replPass 
 		printDryRun("SRC ("+dstIP+" → src)", stmts)
 		return nil
 	}
-	slog.Info("creating replication user", "host", src.Host(), "user", replUser, "from", dstIP)
-	return src.ExecSession(ctx, stmts)
+	if err := src.ExecSession(ctx, stmts); err != nil {
+		return err
+	}
+	color.New(color.FgGreen).Fprintf(os.Stderr, "  ✓ replication user '%s'@'%s' created on %s\n", replUser, dstIP, src.Host())
+	return nil
 }
 
 // ConfigureReplication runs CHANGE REPLICATION SOURCE TO on dst with GTID auto-position.
@@ -96,13 +101,13 @@ func ConfigureReplication(ctx context.Context, dst *Client, srcIP string, srcPor
 		printDryRun(fmt.Sprintf("DST (← %s:%d)", srcIP, srcPort), stmts)
 		return nil
 	}
-	slog.Info("configuring replication", "dst", dst.Host(), "src", fmt.Sprintf("%s:%d", srcIP, srcPort))
 	// Each statement on its own call (STOP/START REPLICA don't need session state).
 	for _, stmt := range stmts {
 		if err := dst.ExecOne(ctx, stmt); err != nil {
 			return fmt.Errorf("%q on %s: %w", stmt, dst.Host(), err)
 		}
 	}
+	color.New(color.FgGreen).Fprintf(os.Stderr, "  ✓ replication configured on %s → %s:%d\n", dst.Host(), srcIP, srcPort)
 	return nil
 }
 

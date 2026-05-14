@@ -24,16 +24,21 @@ var lagFlags struct {
 var lagCmd = &cobra.Command{
 	Use:   "lag",
 	Short: "Show replication lag and status",
-	Long: `Connects to one or more replica hosts and prints replication status.
+	Long: `Connects to one or more replica hosts and prints replication status.`,
+	Example: `  # Single replica
+  mysqlctl lag -d slave1.example.com -u root -p secret
 
-Multiple destinations:
+  # Multiple replicas (repeat flag or comma-separate)
   mysqlctl lag -d slave1 -d slave2 -d slave3
   mysqlctl lag -d slave1,slave2,slave3
 
-Watch mode (auto-refresh):
+  # Replicas on a non-standard port with dedicated credentials
+  mysqlctl lag -d slave1,slave2 --dst-port 3307 --dst-user monitor --dst-password monpass
+
+  # Auto-refresh every 3 seconds
   mysqlctl lag -d slave1 --watch --interval 3s
 
-JSON output:
+  # JSON output for scripting
   mysqlctl lag -d slave1 --json`,
 	RunE: runLag,
 }
@@ -50,8 +55,13 @@ func runLag(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("--dst is required")
 	}
 
-	if err := askPassword(&Cfg.Password, "MySQL password ("+Cfg.User+")"); err != nil {
+	if err := askUser(&Cfg.User, cmd.Root().PersistentFlags().Changed("user")); err != nil {
 		return err
+	}
+	if dstPassword() == "" {
+		if err := askPassword(&Cfg.Password, "MySQL password ("+Cfg.User+")"); err != nil {
+			return err
+		}
 	}
 
 	// Flatten comma-separated values (e.g. -d "h1,h2,h3").
@@ -109,8 +119,8 @@ func printLagForHosts(ctx context.Context, hosts []string) {
 			c, err := mysqlpkg.NewClient(mysqlpkg.Config{
 				Host:     host,
 				Port:     dstPort(),
-				User:     Cfg.User,
-				Password: Cfg.Password,
+				User:     dstUser(),
+				Password: dstPassword(),
 				Timeout:  10 * time.Second,
 			})
 			if err != nil {

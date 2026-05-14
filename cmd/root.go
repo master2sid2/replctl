@@ -21,7 +21,11 @@ var Cfg struct {
 	SrcPort       int
 	DstPort       int
 	User          string
+	SrcUser       string
+	DstUser       string
 	Password      string
+	SrcPassword   string
+	DstPassword   string
 	ClonePassword string
 	ReplUser      string
 	ReplPassword  string
@@ -32,8 +36,6 @@ var Cfg struct {
 	Demo          bool
 }
 
-// srcPort returns the MySQL port for the source host.
-// --src-port overrides --port when set.
 func srcPort() int {
 	if Cfg.SrcPort != 0 {
 		return Cfg.SrcPort
@@ -41,13 +43,39 @@ func srcPort() int {
 	return Cfg.Port
 }
 
-// dstPort returns the MySQL port for destination host(s).
-// --dst-port overrides --port when set.
 func dstPort() int {
 	if Cfg.DstPort != 0 {
 		return Cfg.DstPort
 	}
 	return Cfg.Port
+}
+
+func srcUser() string {
+	if Cfg.SrcUser != "" {
+		return Cfg.SrcUser
+	}
+	return Cfg.User
+}
+
+func dstUser() string {
+	if Cfg.DstUser != "" {
+		return Cfg.DstUser
+	}
+	return Cfg.User
+}
+
+func srcPassword() string {
+	if Cfg.SrcPassword != "" {
+		return Cfg.SrcPassword
+	}
+	return Cfg.Password
+}
+
+func dstPassword() string {
+	if Cfg.DstPassword != "" {
+		return Cfg.DstPassword
+	}
+	return Cfg.Password
 }
 
 var rootCmd = &cobra.Command{
@@ -57,8 +85,14 @@ var rootCmd = &cobra.Command{
 
 Config file: ~/.mysqlctl.yaml
   port: 3306
+  src_port: 0            # overrides port for source only
+  dst_port: 0            # overrides port for destination only
   mysql_user: root
+  src_user: ""           # overrides user for source only
+  dst_user: ""           # overrides user for destination only
   mysql_password: ""
+  src_password: ""       # overrides password for source only
+  dst_password: ""       # overrides password for destination only
   clone_password: "changeme"
   repl_user: replicator
   repl_password: "changeme"
@@ -89,8 +123,12 @@ func init() {
 	pf.IntVar(&Cfg.Port, "port", 3306, "MySQL port (default for both src and dst)")
 	pf.IntVar(&Cfg.SrcPort, "src-port", 0, "source MySQL port (overrides --port)")
 	pf.IntVar(&Cfg.DstPort, "dst-port", 0, "destination MySQL port (overrides --port)")
-	pf.StringVarP(&Cfg.User, "user", "u", "root", "MySQL user")
-	pf.StringVarP(&Cfg.Password, "password", "p", "", "MySQL password")
+	pf.StringVarP(&Cfg.User, "user", "u", "root", "MySQL user (default for both src and dst)")
+	pf.StringVar(&Cfg.SrcUser, "src-user", "", "source MySQL user (overrides --user)")
+	pf.StringVar(&Cfg.DstUser, "dst-user", "", "destination MySQL user (overrides --user)")
+	pf.StringVarP(&Cfg.Password, "password", "p", "", "MySQL password (default for both src and dst)")
+	pf.StringVar(&Cfg.SrcPassword, "src-password", "", "source MySQL password (overrides --password)")
+	pf.StringVar(&Cfg.DstPassword, "dst-password", "", "destination MySQL password (overrides --password)")
 	pf.StringVar(&Cfg.ClonePassword, "clone-password", "", "clone_user password")
 	pf.StringVar(&Cfg.ReplUser, "repl-user", "replicator", "replication user name")
 	pf.StringVar(&Cfg.ReplPassword, "repl-password", "", "replication user password")
@@ -102,7 +140,11 @@ func init() {
 
 	_ = viper.BindPFlag("port", pf.Lookup("port"))
 	_ = viper.BindPFlag("mysql_user", pf.Lookup("user"))
+	_ = viper.BindPFlag("src_user", pf.Lookup("src-user"))
+	_ = viper.BindPFlag("dst_user", pf.Lookup("dst-user"))
 	_ = viper.BindPFlag("mysql_password", pf.Lookup("password"))
+	_ = viper.BindPFlag("src_password", pf.Lookup("src-password"))
+	_ = viper.BindPFlag("dst_password", pf.Lookup("dst-password"))
 	_ = viper.BindPFlag("clone_password", pf.Lookup("clone-password"))
 	_ = viper.BindPFlag("repl_user", pf.Lookup("repl-user"))
 	_ = viper.BindPFlag("repl_password", pf.Lookup("repl-password"))
@@ -130,8 +172,24 @@ func initConfig() {
 			Cfg.User = u
 		}
 	}
+	if !rootCmd.PersistentFlags().Changed("src-user") {
+		if u := viper.GetString("src_user"); u != "" {
+			Cfg.SrcUser = u
+		}
+	}
+	if !rootCmd.PersistentFlags().Changed("dst-user") {
+		if u := viper.GetString("dst_user"); u != "" {
+			Cfg.DstUser = u
+		}
+	}
 	if !rootCmd.PersistentFlags().Changed("password") {
 		Cfg.Password = viper.GetString("mysql_password")
+	}
+	if !rootCmd.PersistentFlags().Changed("src-password") {
+		Cfg.SrcPassword = viper.GetString("src_password")
+	}
+	if !rootCmd.PersistentFlags().Changed("dst-password") {
+		Cfg.DstPassword = viper.GetString("dst_password")
 	}
 	if !rootCmd.PersistentFlags().Changed("clone-password") {
 		Cfg.ClonePassword = viper.GetString("clone_password")
