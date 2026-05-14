@@ -49,6 +49,10 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("source and destination must be different hosts")
 	}
 
+	if Cfg.Demo {
+		return demoSwitch(ctx, Cfg.Src, dst)
+	}
+
 	// Prompt for credentials not set via flag or config.
 	if err := askUser(&Cfg.User, cmd.Root().PersistentFlags().Changed("user")); err != nil {
 		return err

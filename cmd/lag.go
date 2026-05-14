@@ -74,6 +74,15 @@ func runLag(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
+	if Cfg.Demo {
+		if lagFlags.Watch {
+			demoLagWatch(ctx, hosts, lagFlags.Interval)
+			return nil
+		}
+		demoLag(hosts, Cfg.JSON)
+		return nil
+	}
+
 	if lagFlags.Watch {
 		for {
 			fmt.Print("\033[2J\033[H") // clear screen

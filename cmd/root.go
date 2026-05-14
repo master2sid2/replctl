@@ -33,6 +33,49 @@ var Cfg struct {
 	DryRun        bool
 	JSON          bool
 	Verbose       bool
+	Demo          bool
+}
+
+func srcPort() int {
+	if Cfg.SrcPort != 0 {
+		return Cfg.SrcPort
+	}
+	return Cfg.Port
+}
+
+func dstPort() int {
+	if Cfg.DstPort != 0 {
+		return Cfg.DstPort
+	}
+	return Cfg.Port
+}
+
+func srcUser() string {
+	if Cfg.SrcUser != "" {
+		return Cfg.SrcUser
+	}
+	return Cfg.User
+}
+
+func dstUser() string {
+	if Cfg.DstUser != "" {
+		return Cfg.DstUser
+	}
+	return Cfg.User
+}
+
+func srcPassword() string {
+	if Cfg.SrcPassword != "" {
+		return Cfg.SrcPassword
+	}
+	return Cfg.Password
+}
+
+func dstPassword() string {
+	if Cfg.DstPassword != "" {
+		return Cfg.DstPassword
+	}
+	return Cfg.Password
 }
 
 func srcPort() int {
@@ -135,6 +178,7 @@ func init() {
 	pf.BoolVar(&Cfg.DryRun, "dry-run", false, "print SQL without executing")
 	pf.BoolVar(&Cfg.JSON, "json", false, "output results as JSON")
 	pf.BoolVarP(&Cfg.Verbose, "verbose", "v", false, "enable debug logging")
+	pf.BoolVar(&Cfg.Demo, "demo", false, "demo mode: simulate all operations without real MySQL")
 
 	_ = viper.BindPFlag("port", pf.Lookup("port"))
 	_ = viper.BindPFlag("mysql_user", pf.Lookup("user"))
