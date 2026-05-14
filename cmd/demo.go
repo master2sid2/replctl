@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"os"
 	"strconv"
@@ -32,12 +33,16 @@ func demoClone(ctx context.Context, src, dst string) error {
 
 	info.Println("\n[1/4] Checking clone plugin...")
 	demoSleep(ctx, 400*time.Millisecond)
+	slog.Debug("[demo] SELECT PLUGIN_STATUS FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME='clone'", "host", src)
 	color.New(color.FgYellow).Printf("  ✓ clone plugin active on %s\n", src)
+	slog.Debug("[demo] SELECT PLUGIN_STATUS FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME='clone'", "host", dst)
 	color.New(color.FgYellow).Printf("  ✓ clone plugin active on %s\n", dst)
 
 	info.Println("[2/4] Creating clone users...")
 	demoSleep(ctx, 500*time.Millisecond)
+	slog.Debug("[demo] CREATE USER IF NOT EXISTS 'clone_user'@'10.0.0.2' ... GRANT BACKUP_ADMIN", "host", src)
 	color.New(color.FgYellow).Printf("  ✓ clone_user@10.0.0.2 created on %s (BACKUP_ADMIN)\n", src)
+	slog.Debug("[demo] CREATE USER IF NOT EXISTS 'clone_user'@'10.0.0.1' ... GRANT CLONE_ADMIN", "host", dst)
 	color.New(color.FgYellow).Printf("  ✓ clone_user@10.0.0.1 created on %s (CLONE_ADMIN)\n", dst)
 
 	info.Println("[3/4] Cloning...")
@@ -51,11 +56,14 @@ func demoClone(ctx context.Context, src, dst string) error {
 
 	info.Println("Verifying clone status...")
 	demoSleep(ctx, 300*time.Millisecond)
+	slog.Debug("[demo] SELECT STATE FROM performance_schema.clone_status ORDER BY ID DESC LIMIT 1")
 	color.New(color.FgYellow).Println("  ✓ STATE = Completed")
 
 	total := time.Since(totalStart).Round(time.Second)
 	info.Printf("Total time: %s\n", formatDuration(total))
 
+	slog.Debug("[demo] DROP USER 'clone_user'@'10.0.0.2'; UNINSTALL PLUGIN clone", "host", src)
+	slog.Debug("[demo] DROP USER 'clone_user'@'10.0.0.1'; UNINSTALL PLUGIN clone", "host", dst)
 	color.New(color.FgYellow).Println("\n  ✓ clone_user dropped on both servers")
 	color.New(color.FgYellow).Println("  ✓ clone plugin uninstalled")
 
@@ -180,6 +188,7 @@ func demoSwitch(ctx context.Context, src, dst string) error {
 
 	info.Println("\n[1/2] Creating replication user on source...")
 	demoSleep(ctx, 600*time.Millisecond)
+	slog.Debug("[demo] CREATE USER IF NOT EXISTS '"+Cfg.ReplUser+"'@'10.0.0.2' ... GRANT REPLICATION SLAVE", "host", src)
 	yellow.Printf("  ✓ %s@10.0.0.2 created on %s (REPLICATION SLAVE)\n", Cfg.ReplUser, src)
 
 	info.Println("[2/2] Configuring replication on destination...")
@@ -190,6 +199,7 @@ func demoSwitch(ctx context.Context, src, dst string) error {
 		"START REPLICA",
 	} {
 		demoSleep(ctx, 250*time.Millisecond)
+		slog.Debug("[demo] "+step, "host", dst)
 		yellow.Printf("  ✓ %s\n", step)
 	}
 
