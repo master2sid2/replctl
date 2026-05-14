@@ -22,16 +22,14 @@ func EnsureClonePlugin(ctx context.Context, c *Client) error {
 	if err != nil {
 		return fmt.Errorf("check clone plugin on %s: %w", c.Host(), err)
 	}
-	if m != nil && m["PLUGIN_STATUS"] == "ACTIVE" {
-		color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ clone plugin active on %s\n", c.Host())
-		return nil
+	if m == nil || m["PLUGIN_STATUS"] != "ACTIVE" {
+		const install = "INSTALL PLUGIN clone SONAME 'mysql_clone.so'"
+		slog.Debug(install, "host", c.Host())
+		if err := c.ExecOne(ctx, install); err != nil {
+			return err
+		}
 	}
-	fmt.Fprintf(os.Stderr, "  installing clone plugin on %s...\n", c.Host())
-	slog.Debug("INSTALL PLUGIN clone SONAME 'mysql_clone.so'", "host", c.Host())
-	if err := c.ExecOne(ctx, "INSTALL PLUGIN clone SONAME 'mysql_clone.so'"); err != nil {
-		return err
-	}
-	color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ clone plugin installed on %s\n", c.Host())
+	color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ clone plugin active on %s\n", c.Host())
 	return nil
 }
 
@@ -94,7 +92,6 @@ func RunClone(ctx context.Context, dst *Client, srcIP string, srcPort int, clone
 		return fmt.Errorf("set clone donor list: %w", err)
 	}
 	slog.Debug(cloneSQL, "host", dst.Host())
-	fmt.Fprintf(os.Stderr, "  cloning from %s:%d → %s...\n", srcIP, srcPort, dst.Host())
 
 	cloneErrCh := make(chan error, 1)
 	go func() {
