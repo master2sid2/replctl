@@ -20,6 +20,21 @@ var cloneCmd = &cobra.Command{
 	Long: `Installs the clone plugin on both servers, creates temporary clone users,
 executes CLONE INSTANCE FROM (with live per-stage progress), waits for destination
 MySQL to restart, verifies clone_status, then cleans up all temporary objects.`,
+	Example: `  # Basic clone using shared credentials
+  mysqlctl clone -s db1.example.com -d db2.example.com -u root -p secret --clone-password clonepass
+
+  # Different ports on source and destination
+  mysqlctl clone -s db1 -d db2 --src-port 3307 --dst-port 3308 --clone-password clonepass
+
+  # Different credentials on source and destination
+  mysqlctl clone -s db1 -d db2 --src-user admin --dst-user replicator \
+    --src-password srcpass --dst-password dstpass --clone-password clonepass
+
+  # Dry-run to preview SQL without executing
+  mysqlctl clone -s db1 -d db2 --dry-run --clone-password clonepass
+
+  # Custom timeout for large databases
+  mysqlctl clone -s db1 -d db2 --timeout 24h --clone-password clonepass`,
 	RunE: runClone,
 }
 
@@ -38,9 +53,15 @@ func runClone(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("source and destination must be different hosts")
 	}
 
-	// Prompt for passwords if not set via flag or config.
-	if err := askPassword(&Cfg.Password, "MySQL password ("+Cfg.User+")"); err != nil {
+	// Prompt for credentials not set via flag or config.
+	if err := askUser(&Cfg.User, cmd.Root().PersistentFlags().Changed("user")); err != nil {
 		return err
+	}
+	// Prompt for shared password only when needed (per-host passwords may cover both sides).
+	if srcPassword() == "" || dstPassword() == "" {
+		if err := askPassword(&Cfg.Password, "MySQL password ("+Cfg.User+")"); err != nil {
+			return err
+		}
 	}
 	if err := requirePassword(&Cfg.ClonePassword, "Clone user password", "clone-password"); err != nil {
 		return err
@@ -71,7 +92,7 @@ func runClone(cmd *cobra.Command, _ []string) error {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: Cfg.Src, User: Cfg.User, Password: Cfg.Password, Port: srcPort(), Timeout: 30 * time.Second})
+			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: Cfg.Src, User: srcUser(), Password: srcPassword(), Port: srcPort(), Timeout: 30 * time.Second})
 			if err != nil {
 				connErr[0] = err
 				return
@@ -85,7 +106,7 @@ func runClone(cmd *cobra.Command, _ []string) error {
 		}()
 		go func() {
 			defer wg.Done()
-			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: dst, User: Cfg.User, Password: Cfg.Password, Port: dstPort(), Timeout: 30 * time.Second})
+			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: dst, User: dstUser(), Password: dstPassword(), Port: dstPort(), Timeout: 30 * time.Second})
 			if err != nil {
 				connErr[1] = err
 				return
@@ -160,15 +181,15 @@ func runClone(cmd *cobra.Command, _ []string) error {
 	// This is the key difference from the bash version: we confirm STATE='Completed'
 	// so a dropped connection mid-clone is never silently treated as success.
 	if !Cfg.DryRun {
-		info.Println("[4/4] Waiting for destination MySQL to restart...")
-		if err := mysqlpkg.WaitForMySQL(dst, dstPort(), Cfg.User, Cfg.Password, 5*time.Minute); err != nil {
+		info.Println("[4/4] Restarting...")
+		if err := mysqlpkg.WaitForMySQL(dst, dstPort(), dstUser(), dstPassword(), 5*time.Minute); err != nil {
 			return err
 		}
 
 		// Re-open connection to the now-restarted dst.
 		dstClient.Close()
 		fresh, err := mysqlpkg.NewClient(mysqlpkg.Config{
-			Host: dst, User: Cfg.User, Password: Cfg.Password,
+			Host: dst, User: dstUser(), Password: dstPassword(),
 			Port: dstPort(), Timeout: 30 * time.Second,
 		})
 		if err != nil {

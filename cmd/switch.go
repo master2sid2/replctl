@@ -20,6 +20,17 @@ var switchCmd = &cobra.Command{
 	Long: `Creates a replication user on source, then runs STOP REPLICA / RESET REPLICA ALL /
 CHANGE REPLICATION SOURCE TO ... SOURCE_AUTO_POSITION=1 / START REPLICA on destination.
 Run 'clone' first to sync the data before using this command.`,
+	Example: `  # Basic replication setup
+  mysqlctl switch -s db1.example.com -d db2.example.com -u root -p secret \
+    --repl-user replicator --repl-password replpass
+
+  # Source and destination on different ports with different credentials
+  mysqlctl switch -s db1 -d db2 --src-port 3307 --dst-port 3308 \
+    --src-user admin --dst-user dba --src-password p1 --dst-password p2 \
+    --repl-user replicator --repl-password replpass
+
+  # Dry-run to preview SQL
+  mysqlctl switch -s db1 -d db2 --dry-run --repl-user replicator --repl-password replpass`,
 	RunE: runSwitch,
 }
 
@@ -38,9 +49,14 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("source and destination must be different hosts")
 	}
 
-	// Prompt for passwords if not set via flag or config.
-	if err := askPassword(&Cfg.Password, "MySQL password ("+Cfg.User+")"); err != nil {
+	// Prompt for credentials not set via flag or config.
+	if err := askUser(&Cfg.User, cmd.Root().PersistentFlags().Changed("user")); err != nil {
 		return err
+	}
+	if srcPassword() == "" || dstPassword() == "" {
+		if err := askPassword(&Cfg.Password, "MySQL password ("+Cfg.User+")"); err != nil {
+			return err
+		}
 	}
 	if err := requirePassword(&Cfg.ReplPassword, "Replication user password", "repl-password"); err != nil {
 		return err
@@ -69,7 +85,7 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: Cfg.Src, User: Cfg.User, Password: Cfg.Password, Port: srcPort(), Timeout: 30 * time.Second})
+			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: Cfg.Src, User: srcUser(), Password: srcPassword(), Port: srcPort(), Timeout: 30 * time.Second})
 			if err != nil {
 				connErr[0] = err
 				return
@@ -83,7 +99,7 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 		}()
 		go func() {
 			defer wg.Done()
-			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: dst, User: Cfg.User, Password: Cfg.Password, Port: dstPort(), Timeout: 30 * time.Second})
+			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: dst, User: dstUser(), Password: dstPassword(), Port: dstPort(), Timeout: 30 * time.Second})
 			if err != nil {
 				connErr[1] = err
 				return

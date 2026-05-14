@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"bufio"
 	"fmt"
 	"os"
+	"strings"
 
 	"golang.org/x/term"
 )
@@ -50,5 +52,35 @@ func askPassword(ptr *string, label string) error {
 		return err
 	}
 	*ptr = pass
+	return nil
+}
+
+// promptLine reads a plain-text line from the terminal.
+func promptLine(label string) (string, error) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return "", nil
+	}
+	fmt.Fprintf(os.Stderr, "%s: ", label)
+	r := bufio.NewReader(os.Stdin)
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("read input: %w", err)
+	}
+	return strings.TrimSpace(line), nil
+}
+
+// askUser prompts for a MySQL username when flagChanged is false (--user not set on CLI).
+// Keeps the current value if the user presses Enter without typing.
+func askUser(ptr *string, flagChanged bool) error {
+	if flagChanged {
+		return nil
+	}
+	val, err := promptLine(fmt.Sprintf("MySQL user (default: %s)", *ptr))
+	if err != nil {
+		return err
+	}
+	if val != "" {
+		*ptr = val
+	}
 	return nil
 }

@@ -23,11 +23,15 @@ func EnsureClonePlugin(ctx context.Context, c *Client) error {
 		return fmt.Errorf("check clone plugin on %s: %w", c.Host(), err)
 	}
 	if m != nil && m["PLUGIN_STATUS"] == "ACTIVE" {
-		slog.Info("clone plugin already active", "host", c.Host())
+		color.New(color.FgGreen).Fprintf(os.Stderr, "  ✓ clone plugin already active on %s\n", c.Host())
 		return nil
 	}
-	slog.Info("installing clone plugin", "host", c.Host())
-	return c.ExecOne(ctx, "INSTALL PLUGIN clone SONAME 'mysql_clone.so'")
+	fmt.Fprintf(os.Stderr, "  installing clone plugin on %s...\n", c.Host())
+	if err := c.ExecOne(ctx, "INSTALL PLUGIN clone SONAME 'mysql_clone.so'"); err != nil {
+		return err
+	}
+	color.New(color.FgGreen).Fprintf(os.Stderr, "  ✓ clone plugin installed on %s\n", c.Host())
+	return nil
 }
 
 // CreateCloneUsers creates clone_user on src (BACKUP_ADMIN) and dst (CLONE_ADMIN).
@@ -51,14 +55,14 @@ func CreateCloneUsers(ctx context.Context, src, dst *Client, srcIP, dstIP, clone
 		return nil
 	}
 
-	slog.Info("creating clone user on source", "host", src.Host())
 	if err := src.ExecSession(ctx, srcStmts); err != nil {
 		return fmt.Errorf("clone_user on src: %w", err)
 	}
-	slog.Info("creating clone user on destination", "host", dst.Host())
+	color.New(color.FgGreen).Fprintf(os.Stderr, "  ✓ clone_user@%s created on %s (BACKUP_ADMIN)\n", dstIP, src.Host())
 	if err := dst.ExecSession(ctx, dstStmts); err != nil {
 		return fmt.Errorf("clone_user on dst: %w", err)
 	}
+	color.New(color.FgGreen).Fprintf(os.Stderr, "  ✓ clone_user@%s created on %s (CLONE_ADMIN)\n", srcIP, dst.Host())
 	return nil
 }
 
@@ -81,7 +85,7 @@ func RunClone(ctx context.Context, dst *Client, srcIP string, srcPort int, clone
 		return fmt.Errorf("set clone donor list: %w", err)
 	}
 
-	slog.Info("starting clone", "src", fmt.Sprintf("%s:%d", srcIP, srcPort), "dst", dst.Host())
+	fmt.Fprintf(os.Stderr, "  cloning from %s:%d → %s...\n", srcIP, srcPort, dst.Host())
 
 	cloneErrCh := make(chan error, 1)
 	go func() {
@@ -113,11 +117,11 @@ func RunClone(ctx context.Context, dst *Client, srcIP string, srcPort int, clone
 				// Connection drop = MySQL restarted after clone. Not an error here;
 				// the caller must call WaitForMySQL + VerifyCloneStatus to confirm.
 				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-					slog.Info("clone connection dropped — MySQL is restarting")
+					slog.Debug("clone connection dropped — MySQL is restarting")
 					return nil
 				}
 				// Any other non-MySQL error is also treated as an expected restart.
-				slog.Info("clone connection reset", "detail", err.Error())
+				slog.Debug("clone connection reset", "detail", err.Error())
 			}
 			return nil
 
@@ -146,6 +150,7 @@ func VerifyCloneStatus(ctx context.Context, c *Client) error {
 	}
 	switch m["STATE"] {
 	case "Completed", "":
+		color.New(color.FgGreen).Fprintf(os.Stderr, "  ✓ STATE = Completed\n")
 		return nil
 	case "Failed":
 		msg := m["ERROR_MESSAGE"]
@@ -164,7 +169,7 @@ func WaitForMySQL(host string, port int, user, pass string, maxWait time.Duratio
 	deadline := time.Now().Add(maxWait)
 	delay := 3 * time.Second
 
-	slog.Info("waiting for MySQL to restart", "host", host)
+	fmt.Fprintf(os.Stderr, "  waiting for MySQL on %s to restart", host)
 	attempt := 0
 	for time.Now().Before(deadline) {
 		time.Sleep(delay)
@@ -172,6 +177,7 @@ func WaitForMySQL(host string, port int, user, pass string, maxWait time.Duratio
 			delay = min(delay*2, 30*time.Second)
 		}
 		attempt++
+		fmt.Fprintf(os.Stderr, ".")
 
 		cfg := Config{Host: host, Port: port, User: user, Password: pass, Timeout: 5 * time.Second}
 		c, err := NewClient(cfg)
@@ -182,7 +188,7 @@ func WaitForMySQL(host string, port int, user, pass string, maxWait time.Duratio
 		pingErr := c.Ping(context.Background())
 		_ = c.Close()
 		if pingErr == nil {
-			slog.Info("MySQL is back", "host", host, "attempts", attempt)
+			color.New(color.FgGreen).Fprintf(os.Stderr, " ✓\n")
 			return nil
 		}
 		slog.Debug("ping failed", "attempt", attempt, "err", pingErr)
@@ -210,7 +216,7 @@ func CleanupClone(ctx context.Context, src, dst *Client, srcIP, dstIP string) {
 	if err := dst.ExecSession(ctx, dstStmts); err != nil {
 		slog.Warn("cleanup on dst", "err", err)
 	}
-	slog.Info("cleanup complete")
+	color.New(color.FgGreen).Fprintf(os.Stderr, "  ✓ clone_user dropped, clone plugin uninstalled\n")
 }
 
 // ── per-stage progress tracker ───────────────────────────────────────────────
