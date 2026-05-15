@@ -2,7 +2,7 @@
 
 CLI-утилита для управления клонированием и репликацией MySQL 8.0+.
 
-Переписанный на Go аналог bash-скрипта — с конкурентными проверками, live progress-баром клона, конфиг-файлом, graceful shutdown и демо-режимом.
+Переписанный на Go аналог bash-скрипта — с конкурентными проверками, live-прогрессом клона по стейджам с ETA, конфиг-файлом, graceful shutdown и демо-режимом.
 
 ---
 
@@ -10,16 +10,17 @@ CLI-утилита для управления клонированием и р�
 
 | Фича | Описание |
 |------|----------|
-| `clone` | MySQL Clone Plugin: устанавливает плагин, создаёт временных пользователей, запускает `CLONE INSTANCE FROM` с live-прогрессом, ждёт рестарта, чистит за собой |
+| `clone` | MySQL Clone Plugin: устанавливает плагин, создаёт временных пользователей, запускает `CLONE INSTANCE FROM` с live-прогрессом по стейджам, ждёт рестарта, верифицирует статус, чистит за собой |
 | `switch` | Настройка GTID-репликации: создаёт replication user, выполняет `CHANGE REPLICATION SOURCE TO ... SOURCE_AUTO_POSITION=1` |
 | `lag` | Статус репликации с цветным выводом; поддержка нескольких реплик одновременно |
 | `lag --watch` | Автообновление статуса в терминале (аналог `watch`) |
 | `--dry-run` | Выводит SQL без подключения к серверам |
 | `--demo` | Эмуляция всех операций — никаких реальных подключений |
 | `--json` | JSON-вывод для интеграции с другими инструментами |
+| `--native-auth` | `IDENTIFIED WITH mysql_native_password` для MySQL ≤ 8.0 |
 | Конфиг-файл | Параметры по умолчанию из `~/.mysqlctl.yaml` |
 | Пароли | Интерактивный ввод через `term.ReadPassword` — пароль не виден в `ps` и истории |
-| Ctrl+C | Graceful shutdown через `context.WithCancel` |
+| Ctrl+C | Graceful shutdown: cleanup выполняется даже после отмены |
 
 ---
 
@@ -45,8 +46,12 @@ go install .
 ```yaml
 port: 3306
 mysql_user: root
-mysql_password: ""        # оставьте пустым — утилита спросит при запуске
-clone_password: ""        # пароль для временного clone_user
+src_user: ""           # переопределяет user только для источника
+dst_user: ""           # переопределяет user только для назначения
+mysql_password: ""     # оставьте пустым — утилита спросит при запуске
+src_password: ""       # переопределяет password только для источника
+dst_password: ""       # переопределяет password только для назначения
+clone_password: ""     # пароль для временного clone_user
 repl_user: replicator
 repl_password: ""
 timeout: 12h
@@ -66,28 +71,59 @@ export MYSQLCTL_CLONE_PASSWORD=clonepass
 
 ### `clone` — клонирование базы
 
-Полная копия данных с мастера на слейв через MySQL Clone Plugin.  
-После клона слейв автоматически перезапускается — утилита ждёт с экспоненциальным backoff.
+Полная копия данных с источника на назначение через MySQL Clone Plugin.  
+После клона назначение автоматически перезапускается — утилита ждёт с экспоненциальным backoff и верифицирует `clone_status.STATE = Completed`.
 
 ```bash
 mysqlctl clone -s master.example.com -d slave.example.com
+
+# Разные порты
+mysqlctl clone -s db1 -d db2 --src-port 3307 --dst-port 3308 --clone-password pass
+
+# Разные учётные данные для src и dst
+mysqlctl clone -s db1 -d db2 --src-user admin --dst-user dba \
+  --src-password p1 --dst-password p2 --clone-password pass
+
+# Для MySQL ≤ 8.0 (mysql_native_password)
+mysqlctl clone -s db1 -d db2 --native-auth --clone-password pass
 ```
 
 **Порядок шагов:**
 1. Параллельная проверка доступности обоих серверов
 2. Установка clone plugin (если не активен)
 3. Создание временного `clone_user` на обоих серверах
-4. `CLONE INSTANCE FROM` с live progress-баром (опрос `performance_schema.clone_progress`)
-5. Ожидание перезапуска MySQL на слейве
-6. Удаление `clone_user` и деинсталляция плагина
+4. `CLONE INSTANCE FROM` с live-прогрессом по стейджам (ETA, объём, время)
+5. Ожидание перезапуска MySQL на назначении
+6. Верификация `performance_schema.clone_status`
+7. Удаление `clone_user` и деинсталляция плагина
 
 ```
 [1/4] Checking clone plugin...
+  ✓ clone plugin active on master.example.com
+  ✓ clone plugin active on slave.example.com
 [2/4] Creating clone users...
+  ✓ clone_user@<slave_ip> created on master.example.com (BACKUP_ADMIN)
+  ✓ clone_user@<master_ip> created on slave.example.com (CLONE_ADMIN)
 [3/4] Cloning...
-Cloning [FILE COPY] 38% |████████░░░░░░░░░░░░| (18/48 GB, 312 MB/s)
+  ✓ DROP DATA     8s
+  ⠏ FILE COPY     4m12s   ETA ~11m30s    28.4 GB / 64.4 GB   44.1%
+[3/4] Cloning...
+  ✓ DROP DATA     8s
+  ✓ FILE COPY     16m5s       64.4 GB
+  ✓ PAGE COPY     < 1s        160.0 KB
+  ✓ REDO COPY     < 1s        2.5 KB
+  ✓ FILE SYNC     < 1s
 [4/4] Waiting for destination MySQL to restart...
-Clone completed in 2m34s
+  MySQL on slave.example.com is shutting down...
+  Waiting for restart...
+  MySQL is back online ✓
+Verifying clone status...
+  ✓ STATE = Completed
+Total time: 16m59s
+  ✓ clone_user dropped on both servers
+  ✓ clone plugin uninstalled
+
+Done. Destination database is a fresh copy of source.
 ```
 
 ---
@@ -98,11 +134,15 @@ Clone completed in 2m34s
 
 ```bash
 mysqlctl switch -s master.example.com -d slave.example.com
+
+# Разные учётные данные
+mysqlctl switch -s db1 -d db2 --src-user admin --dst-user dba \
+  --src-password p1 --dst-password p2 --repl-password replpass
 ```
 
 Выполняет на мастере:
 ```sql
-CREATE USER 'replicator'@'<slave_ip>' ...;
+CREATE USER 'replicator'@'<slave_ip>' IDENTIFIED BY '...';
 GRANT REPLICATION SLAVE ON *.* TO 'replicator'@'<slave_ip>';
 ```
 
@@ -159,36 +199,31 @@ mysqlctl lag -d slave.example.com --json
 +---------+-----+-----+---------+--------------------+------------+
 ```
 
-**JSON-вывод:**
-```json
-{
-  "host": "slave.example.com",
-  "source_host": "master.example.com",
-  "io_running": true,
-  "sql_running": true,
-  "seconds_behind": 0,
-  "configured": true
-}
-```
-
 ---
 
 ## Глобальные флаги
 
 ```
-  -s, --src string            исходный сервер (IP или FQDN)
-  -d, --dst stringArray       целевой сервер(ы)
-      --port int              MySQL порт (default 3306)
-  -u, --user string           MySQL пользователь (default "root")
-  -p, --password string       MySQL пароль (если не задан — интерактивный ввод)
-      --clone-password string пароль для clone_user
-      --repl-user string      имя replication user (default "replicator")
-      --repl-password string  пароль replication user
-      --timeout duration      таймаут операций (default 12h)
-      --dry-run               вывести SQL без выполнения
-      --json                  JSON-вывод
-      --demo                  демо-режим (эмуляция без реального MySQL)
-  -v, --verbose               debug-логирование
+  -s, --src string              исходный сервер (IP или FQDN)
+  -d, --dst stringArray         целевой сервер(ы)
+      --port int                MySQL порт (default 3306)
+      --src-port int            порт источника (переопределяет --port)
+      --dst-port int            порт назначения (переопределяет --port)
+  -u, --user string             MySQL пользователь (default "root")
+      --src-user string         пользователь источника (переопределяет --user)
+      --dst-user string         пользователь назначения (переопределяет --user)
+  -p, --password string         MySQL пароль (если не задан — интерактивный ввод)
+      --src-password string     пароль источника (переопределяет --password)
+      --dst-password string     пароль назначения (переопределяет --password)
+      --clone-password string   пароль для clone_user
+      --repl-user string        имя replication user (default "replicator")
+      --repl-password string    пароль replication user
+      --timeout duration        таймаут операций (default 12h)
+      --native-auth             IDENTIFIED WITH mysql_native_password (для MySQL ≤ 8.0)
+      --dry-run                 вывести SQL без выполнения
+      --json                    JSON-вывод
+      --demo                    демо-режим (эмуляция без реального MySQL)
+  -v, --verbose                 debug-логирование (SQL, таймстемпы)
 ```
 
 ---
@@ -204,7 +239,7 @@ mysqlctl clone -s master -d slave --clone-password x --dry-run
 ```
 [dry-run] -- SRC (192.168.1.10)
   SET sql_log_bin=0;
-  CREATE USER IF NOT EXISTS 'clone_user'@'192.168.1.11' ...;
+  CREATE USER IF NOT EXISTS 'clone_user'@'192.168.1.11' IDENTIFIED BY 'x';
   GRANT BACKUP_ADMIN ON *.* TO 'clone_user'@'192.168.1.11';
   SET sql_log_bin=1;
 
@@ -220,7 +255,7 @@ mysqlctl clone -s master -d slave --clone-password x --dry-run
 Эмулирует все операции без реального MySQL — удобно для презентаций и тестирования CLI.
 
 ```bash
-# Клон с анимированным прогресс-баром (15–30 сек)
+# Клон с анимированным прогрессом (15–30 сек)
 mysqlctl clone -s any-host -d any-host --demo
 
 # Настройка репликации
@@ -234,7 +269,7 @@ mysqlctl lag -d replica1,replica2 --demo --watch
 ```
 
 В демо-режиме принимаются любые хосты и пароли.  
-Прогресс-бар клона воспроизводит реальные стадии: `DROP DATA → FILE COPY → PAGE COPY → REDO COPY → FILE SYNC`.
+Прогресс клона воспроизводит реальные стадии: `DROP DATA → FILE COPY → PAGE COPY → REDO COPY → FILE SYNC`.
 
 ---
 
@@ -264,14 +299,17 @@ mysqlctl lag -d slave.prod.example.com --watch --interval 5s
 | | bash.sh | mysqlctl |
 |---|---|---|
 | Проверка коннекта | последовательная | параллельная (goroutines) |
-| Прогресс клона | нет | live bar via `clone_progress` |
+| Прогресс клона | нет | live стейджи с ETA via `clone_progress` |
+| Обрыв соединения при клоне | не обрабатывается | polling `clone_status` до Completed |
 | Ожидание рестарта | `sleep 60` | экспоненциальный backoff |
 | Пароли | видны в `ps` / истории | интерактивный ввод |
+| Раздельные credentials | нет | `--src-user/password`, `--dst-user/password` |
 | Конфиг | хардкод в скрипте | `~/.mysqlctl.yaml` + env |
-| Отмена операции | kill процесса | Ctrl+C через context |
+| Отмена операции | kill процесса | Ctrl+C + cleanup через context |
 | Несколько реплик | нет | параллельный опрос + таблица |
 | Вывод | только текст | текст / JSON |
 | Сухой прогон | нет | `--dry-run` |
+| Демо без MySQL | нет | `--demo` |
 
 ---
 
@@ -281,19 +319,17 @@ mysqlctl lag -d slave.prod.example.com --watch --interval 5s
 .
 ├── main.go
 ├── cmd/
-│   ├── root.go      # cobra root, persistent flags, viper config
+│   ├── root.go      # cobra root, persistent flags, viper config, credential helpers
 │   ├── clone.go     # команда clone
 │   ├── switch.go    # команда switch
 │   ├── lag.go       # команда lag (--watch, --multi, --json)
 │   ├── demo.go      # эмуляция всех операций (--demo)
-│   └── prompt.go    # интерактивный ввод паролей
+│   └── prompt.go    # интерактивный ввод пользователя и паролей
 └── internal/
     ├── mysql/
-    │   ├── client.go  # DB-клиент, DSN, ExecSession
-    │   ├── clone.go   # clone plugin, прогресс, cleanup
+    │   ├── client.go  # DB-клиент, DSN, ReadTimeout, ExecSession
+    │   ├── clone.go   # clone plugin, прогресс со спиннером/ETA, cleanup
     │   └── repl.go    # статус репликации, CHANGE SOURCE
-    ├── dns/
-    │   └── resolve.go # hostname → IP
-    └── progress/
-        └── bar.go     # обёртка над progressbar/v3
+    └── dns/
+        └── resolve.go # hostname → IP
 ```
