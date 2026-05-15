@@ -147,7 +147,7 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 
 	// Step 1: Create replication user on source.
 	info.Println("\n[1/2] Creating replication user on source...")
-	if err := mysqlpkg.CreateReplUser(ctx, srcClient, dstIP, Cfg.ReplUser, Cfg.ReplPassword, Cfg.DryRun); err != nil {
+	if err := mysqlpkg.CreateReplUser(ctx, srcClient, dstIP, Cfg.ReplUser, Cfg.ReplPassword, Cfg.DryRun, Cfg.NativeAuth); err != nil {
 		return fmt.Errorf("create repl user: %w", err)
 	}
 

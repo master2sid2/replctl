@@ -34,6 +34,7 @@ var Cfg struct {
 	JSON          bool
 	Verbose       bool
 	Demo          bool
+	NativeAuth    bool
 }
 
 func srcPort() int {
@@ -137,6 +138,7 @@ func init() {
 	pf.BoolVar(&Cfg.JSON, "json", false, "output results as JSON")
 	pf.BoolVarP(&Cfg.Verbose, "verbose", "v", false, "enable debug logging")
 	pf.BoolVar(&Cfg.Demo, "demo", false, "demo mode: simulate all operations without real MySQL")
+	pf.BoolVar(&Cfg.NativeAuth, "native-auth", false, "use IDENTIFIED WITH mysql_native_password (for MySQL ≤ 8.0)")
 
 	_ = viper.BindPFlag("port", pf.Lookup("port"))
 	_ = viper.BindPFlag("mysql_user", pf.Lookup("user"))

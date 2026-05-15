@@ -11,11 +11,12 @@ import (
 
 // Config holds connection parameters.
 type Config struct {
-	Host     string
-	Port     int
-	User     string
-	Password string
-	Timeout  time.Duration
+	Host        string
+	Port        int
+	User        string
+	Password    string
+	Timeout     time.Duration // TCP connect timeout
+	ReadTimeout time.Duration // SQL read timeout; 0 = same as Timeout; negative = no timeout
 }
 
 // Client wraps *sql.DB with convenience methods.
@@ -30,11 +31,24 @@ func NewClient(cfg Config) (*Client, error) {
 	if timeout == 0 {
 		timeout = 30 * time.Second
 	}
-	dsn := fmt.Sprintf(
-		"%s:%s@tcp(%s:%d)/?timeout=%s&readTimeout=%s&parseTime=true&interpolateParams=true",
-		cfg.User, cfg.Password, cfg.Host, cfg.Port,
-		timeout.String(), timeout.String(),
-	)
+	var dsn string
+	if cfg.ReadTimeout < 0 {
+		// No read timeout (e.g. long-running CLONE statement).
+		dsn = fmt.Sprintf(
+			"%s:%s@tcp(%s:%d)/?timeout=%s&parseTime=true&interpolateParams=true",
+			cfg.User, cfg.Password, cfg.Host, cfg.Port, timeout.String(),
+		)
+	} else {
+		readTimeout := cfg.ReadTimeout
+		if readTimeout == 0 {
+			readTimeout = timeout
+		}
+		dsn = fmt.Sprintf(
+			"%s:%s@tcp(%s:%d)/?timeout=%s&readTimeout=%s&parseTime=true&interpolateParams=true",
+			cfg.User, cfg.Password, cfg.Host, cfg.Port,
+			timeout.String(), readTimeout.String(),
+		)
+	}
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open %s:%d: %w", cfg.Host, cfg.Port, err)

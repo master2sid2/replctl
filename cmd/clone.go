@@ -165,15 +165,27 @@ func runClone(cmd *cobra.Command, _ []string) error {
 
 	// Step 2: Create clone users.
 	info.Println("[2/4] Creating clone users...")
-	if err := mysqlpkg.CreateCloneUsers(ctx, srcClient, dstClient, srcIP, dstIP, Cfg.ClonePassword, Cfg.DryRun); err != nil {
+	if err := mysqlpkg.CreateCloneUsers(ctx, srcClient, dstClient, srcIP, dstIP, Cfg.ClonePassword, Cfg.DryRun, Cfg.NativeAuth); err != nil {
 		return err
 	}
 
 	// Step 3: Execute CLONE with per-stage progress display.
+	// CLONE can run for hours, so we use a dedicated connection with no read timeout.
 	// RunClone returns when the CLONE statement finishes or the connection drops
 	// (expected after MySQL auto-restart). Verification happens in step 4.
 	info.Println("[3/4] Cloning...")
 	totalStart := time.Now()
+	if !Cfg.DryRun {
+		cloneClient, err := mysqlpkg.NewClient(mysqlpkg.Config{
+			Host: dst, User: dstUser(), Password: dstPassword(),
+			Port: dstPort(), Timeout: 30 * time.Second, ReadTimeout: -1,
+		})
+		if err != nil {
+			return fmt.Errorf("open clone connection: %w", err)
+		}
+		defer cloneClient.Close()
+		dstClient = cloneClient
+	}
 	if err := mysqlpkg.RunClone(ctx, dstClient, srcIP, srcPort(), Cfg.ClonePassword, Cfg.DryRun); err != nil {
 		if !Cfg.DryRun {
 			mysqlpkg.CleanupClone(ctx, srcClient, dstClient, srcIP, dstIP)

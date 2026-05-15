@@ -66,12 +66,12 @@ func GetReplicaStatus(ctx context.Context, c *Client) (*ReplicaStatus, error) {
 }
 
 // CreateReplUser creates the replication user on src for dstIP.
-func CreateReplUser(ctx context.Context, src *Client, dstIP, replUser, replPass string, dryRun bool) error {
+func CreateReplUser(ctx context.Context, src *Client, dstIP, replUser, replPass string, dryRun, nativeAuth bool) error {
 	stmts := []string{
 		"SET sql_log_bin=0",
 		fmt.Sprintf(
-			"CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED WITH mysql_native_password BY '%s'",
-			replUser, dstIP, replPass,
+			"CREATE USER IF NOT EXISTS '%s'@'%s' %s",
+			replUser, dstIP, identifiedBy(replPass, nativeAuth),
 		),
 		fmt.Sprintf("GRANT REPLICATION SLAVE ON *.* TO '%s'@'%s'", replUser, dstIP),
 		"SET sql_log_bin=1",
