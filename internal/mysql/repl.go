@@ -69,8 +69,9 @@ func GetReplicaStatus(ctx context.Context, c *Client) (*ReplicaStatus, error) {
 func CreateReplUser(ctx context.Context, src *Client, dstIP, replUser, replPass string, dryRun, nativeAuth bool) error {
 	stmts := []string{
 		"SET sql_log_bin=0",
+		fmt.Sprintf("DROP USER IF EXISTS '%s'@'%s'", replUser, dstIP),
 		fmt.Sprintf(
-			"CREATE USER IF NOT EXISTS '%s'@'%s' %s",
+			"CREATE USER '%s'@'%s' %s",
 			replUser, dstIP, identifiedBy(replPass, nativeAuth),
 		),
 		fmt.Sprintf("GRANT REPLICATION SLAVE ON *.* TO '%s'@'%s'", replUser, dstIP),
@@ -93,12 +94,12 @@ func CreateReplUser(ctx context.Context, src *Client, dstIP, replUser, replPass 
 // ConfigureReplication runs CHANGE REPLICATION SOURCE TO on dst with GTID auto-position.
 func ConfigureReplication(ctx context.Context, dst *Client, srcIP string, srcPort int, replUser, replPass string, dryRun bool) error {
 	changeStmt := fmt.Sprintf(
-		"CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', SOURCE_AUTO_POSITION=1",
+		"CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', SOURCE_AUTO_POSITION=1, SOURCE_SSL=1",
 		srcIP, srcPort, replUser, replPass,
 	)
 	// Display label omits the password.
 	changeLabel := fmt.Sprintf(
-		"CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_AUTO_POSITION=1",
+		"CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_AUTO_POSITION=1, SOURCE_SSL=1",
 		srcIP,
 	)
 	type step struct{ sql, label string }
