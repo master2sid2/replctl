@@ -55,7 +55,7 @@ func runLag(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("--dst is required")
 	}
 
-	if err := askUser(&Cfg.User, cmd.Root().PersistentFlags().Changed("user")); err != nil {
+	if err := askUser(&Cfg.User, cmd.Root().PersistentFlags().Changed("user") || userSetFromConfig); err != nil {
 		return err
 	}
 	if dstPassword() == "" {

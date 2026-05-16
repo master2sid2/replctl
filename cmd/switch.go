@@ -54,7 +54,7 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 	}
 
 	// Prompt for credentials not set via flag or config.
-	if err := askUser(&Cfg.User, cmd.Root().PersistentFlags().Changed("user")); err != nil {
+	if err := askUser(&Cfg.User, cmd.Root().PersistentFlags().Changed("user") || userSetFromConfig); err != nil {
 		return err
 	}
 	if srcPassword() == "" || dstPassword() == "" {

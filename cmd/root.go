@@ -13,6 +13,10 @@ import (
 	"github.com/spf13/viper"
 )
 
+// userSetFromConfig is true when mysql_user was read from the config file.
+// Used by askUser to skip interactive prompting when config already provides a user.
+var userSetFromConfig bool
+
 // Cfg holds values resolved from flags + config file.
 var Cfg struct {
 	Src           string
@@ -172,6 +176,7 @@ func initConfig() {
 	if !rootCmd.PersistentFlags().Changed("user") {
 		if u := viper.GetString("mysql_user"); u != "" {
 			Cfg.User = u
+			userSetFromConfig = true
 		}
 	}
 	if !rootCmd.PersistentFlags().Changed("src-user") {
