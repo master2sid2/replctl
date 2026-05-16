@@ -9,10 +9,10 @@ CLI tool for MySQL 8.0+ cloning and replication management.
 | Feature | Description |
 |---------|-------------|
 | `clone` | MySQL Clone Plugin: installs plugin, creates temporary users, runs `CLONE INSTANCE FROM` with live per-stage progress and ETA, waits for restart, verifies clone status, cleans up |
-| `switch` | GTID replication setup: creates replication user, runs `CHANGE REPLICATION SOURCE TO ... SOURCE_AUTO_POSITION=1` |
+| `switch` | GTID replication setup: recreates replication user, runs `CHANGE REPLICATION SOURCE TO ... SOURCE_AUTO_POSITION=1, SOURCE_SSL=1` |
 | `lag` | Replication status with color output; supports multiple replicas simultaneously |
 | `lag --watch` | Continuous status refresh (like `watch`) |
-| `--dry-run` | Prints SQL without connecting to servers |
+| `--dry-run` | Prints SQL without connecting to servers; passwords are masked as `****` |
 | `--demo` | Simulates all operations — no real MySQL connections |
 | `--json` | JSON output for scripting and monitoring |
 | `--native-auth` | `IDENTIFIED WITH mysql_native_password` for MySQL ≤ 8.0 |
@@ -43,10 +43,10 @@ Create `~/.mysqlctl.yaml` to avoid repeating common flags:
 
 ```yaml
 port: 3306
-mysql_user: root
+mysql_user: root       # set here to skip the interactive username prompt
 src_user: ""           # overrides user for source only
 dst_user: ""           # overrides user for destination only
-mysql_password: ""     # leave empty — tool will prompt interactively
+mysql_password: ""     # set here or leave empty — tool will prompt interactively
 src_password: ""       # overrides password for source only
 dst_password: ""       # overrides password for destination only
 clone_password: ""     # password for temporary clone_user
@@ -143,6 +143,7 @@ mysqlctl switch -s db1 -d db2 --src-user admin --dst-user dba \
 
 Runs on source:
 ```sql
+DROP USER IF EXISTS 'replicator'@'<dst_ip>';
 CREATE USER 'replicator'@'<dst_ip>' IDENTIFIED BY '...';
 GRANT REPLICATION SLAVE ON *.* TO 'replicator'@'<dst_ip>';
 ```
@@ -154,9 +155,13 @@ RESET REPLICA ALL;
 CHANGE REPLICATION SOURCE TO
   SOURCE_HOST='<src_ip>',
   SOURCE_USER='replicator',
-  SOURCE_AUTO_POSITION=1;
+  SOURCE_AUTO_POSITION=1,
+  SOURCE_SSL=1;
 START REPLICA;
 ```
+
+`DROP USER IF EXISTS` ensures the password is always updated on repeated runs.  
+`SOURCE_SSL=1` is required for `caching_sha2_password` (MySQL 8.0 default) without a pre-shared RSA key.
 
 After setup, automatically displays replication status.
 
@@ -240,14 +245,22 @@ mysqlctl clone -s db1 -d db2 --clone-password x --dry-run
 ```
 [dry-run] -- SRC (192.168.1.10)
   SET sql_log_bin=0;
-  CREATE USER IF NOT EXISTS 'clone_user'@'192.168.1.11' IDENTIFIED BY 'x';
+  CREATE USER IF NOT EXISTS 'clone_user'@'192.168.1.11' IDENTIFIED BY '****';
   GRANT BACKUP_ADMIN ON *.* TO 'clone_user'@'192.168.1.11';
   SET sql_log_bin=1;
 
 [dry-run] -- DST (192.168.1.11)
+  SET sql_log_bin=0;
+  CREATE USER IF NOT EXISTS 'clone_user'@'192.168.1.10' IDENTIFIED BY '****';
+  GRANT CLONE_ADMIN ON *.* TO 'clone_user'@'192.168.1.10';
+  SET sql_log_bin=1;
+
+[dry-run] -- DST (← 192.168.1.10:3306)
   SET GLOBAL clone_valid_donor_list = '192.168.1.10:3306';
-  CLONE INSTANCE FROM 'clone_user'@'192.168.1.10':3306 IDENTIFIED BY 'x';
+  CLONE INSTANCE FROM 'clone_user'@'192.168.1.10':3306 IDENTIFIED BY '****';
 ```
+
+Passwords are always masked in dry-run output. `DST (← src)` indicates the SQL runs on the destination but clones data from the source.
 
 ---
 
