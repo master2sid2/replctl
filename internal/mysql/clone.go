@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -92,7 +93,7 @@ func RunClone(ctx context.Context, dst *Client, srcIP string, srcPort int, clone
 	)
 
 	if dryRun {
-		printDryRun(fmt.Sprintf("DST (%s:%d)", srcIP, srcPort), []string{donorSQL, cloneSQL})
+		printDryRun(fmt.Sprintf("DST (← %s:%d)", srcIP, srcPort), []string{donorSQL, cloneSQL})
 		return nil
 	}
 
@@ -447,9 +448,15 @@ func fmtBytes(b int64) string {
 	}
 }
 
+var rePassword = regexp.MustCompile(`(?i)(BY\s+|PASSWORD=)'[^']*'`)
+
+func maskSQL(s string) string {
+	return rePassword.ReplaceAllString(s, "${1}'****'")
+}
+
 func printDryRun(target string, stmts []string) {
 	fmt.Printf("[dry-run] -- %s\n", target)
 	for _, s := range stmts {
-		fmt.Printf("  %s;\n", s)
+		fmt.Printf("  %s;\n", maskSQL(s))
 	}
 }
