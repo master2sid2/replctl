@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/fatih/color"
@@ -38,23 +38,26 @@ func EnsureClonePlugin(ctx context.Context, c *Client) error {
 // With nativeAuth=true uses mysql_native_password for compatibility with MySQL ≤ 8.0.
 func identifiedBy(password string, nativeAuth bool) string {
 	if nativeAuth {
-		return fmt.Sprintf("IDENTIFIED WITH mysql_native_password BY '%s'", password)
+		return "IDENTIFIED WITH mysql_native_password BY " + quote(password)
 	}
-	return fmt.Sprintf("IDENTIFIED BY '%s'", password)
+	return "IDENTIFIED BY " + quote(password)
 }
 
 // CreateCloneUsers creates clone_user on src (BACKUP_ADMIN) and dst (CLONE_ADMIN).
+// A clone_user left over from an earlier run is dropped first so the password always matches.
 func CreateCloneUsers(ctx context.Context, src, dst *Client, srcIP, dstIP, clonePass string, dryRun, nativeAuth bool) error {
 	srcStmts := []string{
 		"SET sql_log_bin=0",
-		fmt.Sprintf("CREATE USER IF NOT EXISTS 'clone_user'@'%s' %s", dstIP, identifiedBy(clonePass, nativeAuth)),
-		fmt.Sprintf("GRANT BACKUP_ADMIN ON *.* TO 'clone_user'@'%s'", dstIP),
+		"DROP USER IF EXISTS " + account("clone_user", dstIP),
+		fmt.Sprintf("CREATE USER %s %s", account("clone_user", dstIP), identifiedBy(clonePass, nativeAuth)),
+		"GRANT BACKUP_ADMIN ON *.* TO " + account("clone_user", dstIP),
 		"SET sql_log_bin=1",
 	}
 	dstStmts := []string{
 		"SET sql_log_bin=0",
-		fmt.Sprintf("CREATE USER IF NOT EXISTS 'clone_user'@'%s' %s", srcIP, identifiedBy(clonePass, nativeAuth)),
-		fmt.Sprintf("GRANT CLONE_ADMIN ON *.* TO 'clone_user'@'%s'", srcIP),
+		"DROP USER IF EXISTS " + account("clone_user", srcIP),
+		fmt.Sprintf("CREATE USER %s %s", account("clone_user", srcIP), identifiedBy(clonePass, nativeAuth)),
+		"GRANT CLONE_ADMIN ON *.* TO " + account("clone_user", srcIP),
 		"SET sql_log_bin=1",
 	}
 
@@ -65,7 +68,7 @@ func CreateCloneUsers(ctx context.Context, src, dst *Client, srcIP, dstIP, clone
 	}
 
 	for _, s := range srcStmts {
-		slog.Debug(s, "host", src.Host())
+		slog.Debug(maskSQL(s), "host", src.Host())
 	}
 	if err := src.ExecSession(ctx, srcStmts); err != nil {
 		return fmt.Errorf("clone_user on src: %w", err)
@@ -73,7 +76,7 @@ func CreateCloneUsers(ctx context.Context, src, dst *Client, srcIP, dstIP, clone
 	color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ clone_user@%s created on %s (BACKUP_ADMIN)\n", dstIP, src.Host())
 
 	for _, s := range dstStmts {
-		slog.Debug(s, "host", dst.Host())
+		slog.Debug(maskSQL(s), "host", dst.Host())
 	}
 	if err := dst.ExecSession(ctx, dstStmts); err != nil {
 		return fmt.Errorf("clone_user on dst: %w", err)
@@ -82,37 +85,81 @@ func CreateCloneUsers(ctx context.Context, src, dst *Client, srcIP, dstIP, clone
 	return nil
 }
 
+const (
+	// erRestartFailed: CLONE copied the data but mysqld could not restart itself
+	// because it is not managed by a supervisor (systemd, mysqld_safe).
+	erRestartFailed = 3707
+	erNoSuchTable   = 1146
+	erPluginInUse   = 1883
+)
+
 // RunClone executes CLONE INSTANCE FROM on dst with per-stage progress display.
-// Returns nil when the CLONE statement finishes (or connection drops due to restart).
-// After this returns, call WaitForMySQL + VerifyCloneStatus to confirm success.
-func RunClone(ctx context.Context, dst *Client, srcIP string, srcPort int, clonePass string, dryRun bool) error {
-	donorSQL := fmt.Sprintf("SET GLOBAL clone_valid_donor_list = '%s:%d'", srcIP, srcPort)
+// mon is a regular client to the same server, used for progress polling and for
+// killing the CLONE when ctx is cancelled or times out.
+//
+// It returns a server-side time marker taken right before the CLONE started; pass
+// it to VerifyCloneStatus. A nil error only means the statement finished or the
+// connection dropped (expected when MySQL restarts) — it is NOT proof of success.
+func RunClone(ctx context.Context, dst, mon *Client, srcIP string, srcPort int, clonePass string, dryRun bool) (string, error) {
+	donorSQL := "SET GLOBAL clone_valid_donor_list = " + quote(fmt.Sprintf("%s:%d", srcIP, srcPort))
 	cloneSQL := fmt.Sprintf(
-		"CLONE INSTANCE FROM 'clone_user'@'%s':%d IDENTIFIED BY '%s'",
-		srcIP, srcPort, clonePass,
+		"CLONE INSTANCE FROM %s:%d IDENTIFIED BY %s",
+		account("clone_user", srcIP), srcPort, quote(clonePass),
 	)
 
 	if dryRun {
 		printDryRun(fmt.Sprintf("DST (← %s:%d)", srcIP, srcPort), []string{donorSQL, cloneSQL})
-		return nil
+		return "", nil
 	}
 
-	slog.Debug(donorSQL, "host", dst.Host())
-	if err := dst.ExecOne(ctx, donorSQL); err != nil {
-		return fmt.Errorf("set clone donor list: %w", err)
+	m, err := mon.QueryMap(ctx, "SELECT UNIX_TIMESTAMP(NOW(3)) AS ts")
+	if err != nil {
+		return "", fmt.Errorf("read server time on %s: %w", mon.Host(), err)
 	}
-	slog.Debug(cloneSQL, "host", dst.Host())
+	since := m["ts"]
+	if _, err := strconv.ParseFloat(since, 64); err != nil {
+		return "", fmt.Errorf("unexpected server time %q on %s", since, mon.Host())
+	}
+
+	// CLONE runs on one dedicated connection so we know which thread to KILL.
+	conn, err := dst.db.Conn(ctx)
+	if err != nil {
+		return "", fmt.Errorf("open clone connection: %w", err)
+	}
+	defer conn.Close()
+
+	var connID int64
+	if err := conn.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&connID); err != nil {
+		return "", fmt.Errorf("read clone connection id: %w", err)
+	}
+	slog.Debug(donorSQL, "host", dst.Host())
+	if _, err := conn.ExecContext(ctx, donorSQL); err != nil {
+		return "", fmt.Errorf("set clone donor list: %w", err)
+	}
+	slog.Debug(maskSQL(cloneSQL), "host", dst.Host(), "connection_id", connID)
 
 	cloneErrCh := make(chan error, 1)
 	go func() {
-		_, err := dst.db.ExecContext(ctx, cloneSQL)
+		_, err := conn.ExecContext(ctx, cloneSQL)
 		cloneErrCh <- err
 	}()
 
-	// Give MySQL a moment before polling progress.
-	time.Sleep(2 * time.Second)
-
 	tracker := newCloneTracker()
+	poll := func() {
+		pctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if rows, err := mon.QueryRows(pctx, cloneProgressQuery); err == nil {
+			tracker.update(rows)
+		}
+	}
+	interrupted := func() (string, error) {
+		fmt.Fprintf(os.Stderr, "\r\033[K")
+		killClone(mon, connID)
+		return since, fmt.Errorf(
+			"clone interrupted (%w): destination %s is left with INCOMPLETE data, re-run clone",
+			ctx.Err(), dst.Host())
+	}
+
 	dataTicker := time.NewTicker(2 * time.Second)
 	spinTicker := time.NewTicker(100 * time.Millisecond)
 	defer dataTicker.Stop()
@@ -121,60 +168,134 @@ func RunClone(ctx context.Context, dst *Client, srcIP string, srcPort int, clone
 	for {
 		select {
 		case err := <-cloneErrCh:
-			// Final refresh so we don't miss the last completed stage.
-			if rows, e := dst.QueryRows(context.Background(), cloneProgressQuery); e == nil {
-				tracker.update(rows)
+			if err != nil && ctx.Err() != nil {
+				return interrupted()
 			}
+			// Final refresh so we don't miss the last completed stage.
+			poll()
 			fmt.Fprintf(os.Stderr, "\r\033[K") // clear spinner line
 
-			if err != nil {
-				var mysqlErr *gmysql.MySQLError
-				if errors.As(err, &mysqlErr) {
-					return fmt.Errorf("clone MySQL error %d: %s", mysqlErr.Number, mysqlErr.Message)
+			var mysqlErr *gmysql.MySQLError
+			if errors.As(err, &mysqlErr) {
+				if mysqlErr.Number == erRestartFailed {
+					// The data is in place; the clone completes once mysqld is started
+					// again, so let the caller wait for it and verify as usual.
+					color.New(color.FgRed).Fprintf(os.Stderr,
+						"  ! mysqld on %s cannot restart itself (not managed by systemd/mysqld_safe) and has shut down.\n"+
+							"    Start it manually now to finish the clone.\n", dst.Host())
+					return since, nil
 				}
-				// Connection drop = MySQL restarted after clone. Not an error here;
-				// the caller must call WaitForMySQL + VerifyCloneStatus to confirm.
-				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-					slog.Debug("clone connection dropped — MySQL is restarting")
-					return nil
-				}
-				// Any other non-MySQL error is also treated as an expected restart.
-				slog.Debug("clone connection reset", "detail", err.Error())
+				return since, fmt.Errorf("clone MySQL error %d: %s", mysqlErr.Number, mysqlErr.Message)
 			}
-			return nil
+			if err != nil {
+				// Usually MySQL restarting after the clone, but may also be a network
+				// failure: the caller must run WaitForMySQL + VerifyCloneStatus.
+				slog.Debug("clone connection closed", "detail", err.Error())
+			}
+			return since, nil
 
 		case <-dataTicker.C:
-			if rows, err := dst.QueryRows(context.Background(), cloneProgressQuery); err == nil {
-				tracker.update(rows)
-			}
+			poll()
 
 		case <-spinTicker.C:
 			tracker.spin()
 
 		case <-ctx.Done():
-			fmt.Fprintf(os.Stderr, "\r\033[K")
-			return ctx.Err()
+			select {
+			case <-cloneErrCh:
+			case <-time.After(10 * time.Second):
+			}
+			return interrupted()
 		}
 	}
 }
 
-// VerifyCloneStatus reconnects to dst and checks performance_schema.clone_status.
-// If STATE is 'In Progress' (connection dropped but clone is still running), it polls
-// until the clone completes or fails. Returns nil only when STATE = 'Completed'.
-func VerifyCloneStatus(ctx context.Context, c *Client) error {
-	const q = "SELECT STATE, ERROR_NO, ERROR_MESSAGE FROM performance_schema.clone_status ORDER BY ID DESC LIMIT 1"
-	yellow := color.New(color.FgYellow)
-	first := true
-	for {
-		m, err := c.QueryMap(ctx, q)
-		if err != nil || m == nil {
-			// clone_status unavailable (older MySQL, or table empty on first clone).
-			slog.Warn("cannot verify clone_status, assuming success", "err", err)
+// killClone terminates the server thread running CLONE. Closing the client
+// connection is not enough: the server keeps cloning until the thread is killed.
+func killClone(mon *Client, connID int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	kill := fmt.Sprintf("KILL %d", connID)
+	slog.Debug(kill, "host", mon.Host())
+	err := mon.ExecOne(ctx, kill)
+	var mysqlErr *gmysql.MySQLError
+	if err == nil || (errors.As(err, &mysqlErr) && mysqlErr.Number == 1094) { // 1094: unknown thread id
+		color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ CLONE stopped on %s\n", mon.Host())
+		return
+	}
+	color.New(color.FgRed).Fprintf(os.Stderr,
+		"  ✗ could not stop CLONE on %s (thread %d): %v\n    check SHOW PROCESSLIST there and KILL it manually\n",
+		mon.Host(), connID, err)
+}
+
+// VerifyCloneStatus checks performance_schema.clone_status on c and returns nil only
+// when it holds a record of a clone that began at or after since (the marker returned
+// by RunClone) and finished with STATE = 'Completed'. While the state is 'In Progress'
+// (connection dropped but the clone is still running) it keeps polling. Query errors
+// are retried for up to maxErrWait, since the server may still be restarting.
+// Anything else — no record, a record of an earlier clone, an unknown state — is an error.
+func VerifyCloneStatus(ctx context.Context, c *Client, since string, maxErrWait time.Duration) error {
+	q := fmt.Sprintf(`SELECT STATE, ERROR_NO, ERROR_MESSAGE, SOURCE,
+UNIX_TIMESTAMP(BEGIN_TIME) >= %s AS IS_CURRENT
+FROM performance_schema.clone_status ORDER BY ID DESC LIMIT 1`, since)
+
+	wait := func(d time.Duration) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(d):
 			return nil
 		}
+	}
+
+	yellow := color.New(color.FgYellow)
+	var errSince time.Time
+	announced, pluginTried := false, false
+	for {
+		m, err := c.QueryMap(ctx, q)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			var mysqlErr *gmysql.MySQLError
+			if errors.As(err, &mysqlErr) && mysqlErr.Number == erNoSuchTable && !pluginTried {
+				// The plugin is not loaded after the restart (it was not registered in
+				// the cloned mysql.plugin); load it to read the persisted status.
+				pluginTried = true
+				if err := EnsureClonePlugin(ctx, c); err != nil {
+					return fmt.Errorf("cannot verify clone: %w", err)
+				}
+				continue
+			}
+			if errSince.IsZero() {
+				errSince = time.Now()
+			}
+			if time.Since(errSince) > maxErrWait {
+				return fmt.Errorf("cannot verify clone: reading clone_status on %s: %w", c.Host(), err)
+			}
+			slog.Debug("clone_status query failed, retrying", "err", err)
+			if err := wait(3 * time.Second); err != nil {
+				return err
+			}
+			continue
+		}
+		errSince = time.Time{}
+
+		if m == nil {
+			return fmt.Errorf("clone not confirmed: clone_status on %s is empty — the CLONE never started", c.Host())
+		}
+		if m["IS_CURRENT"] != "1" {
+			return fmt.Errorf(
+				"clone not confirmed: clone_status on %s only has an earlier clone (%s from %s) — this CLONE never started",
+				c.Host(), m["STATE"], m["SOURCE"])
+		}
+
 		switch m["STATE"] {
-		case "Completed", "":
-			yellow.Fprintf(os.Stderr, "  ✓ STATE = Completed\n")
+		case "Completed":
+			if no := m["ERROR_NO"]; no != "" && no != "0" {
+				return fmt.Errorf("clone finished with error %s: %s", no, m["ERROR_MESSAGE"])
+			}
+			yellow.Fprintf(os.Stderr, "  ✓ STATE = Completed (source %s)\n", m["SOURCE"])
 			return nil
 		case "Failed":
 			msg := m["ERROR_MESSAGE"]
@@ -182,35 +303,33 @@ func VerifyCloneStatus(ctx context.Context, c *Client) error {
 				msg = "error code " + m["ERROR_NO"]
 			}
 			return fmt.Errorf("clone failed on server: %s", msg)
-		case "Incomplete":
-			return fmt.Errorf("clone incomplete on server: operation was interrupted")
-		case "In Progress":
-			if first {
+		case "In Progress", "Not Started":
+			if !announced {
 				fmt.Fprintf(os.Stderr, "  clone still running on server, waiting...\n")
-				first = false
+				announced = true
 			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(5 * time.Second):
+			if err := wait(5 * time.Second); err != nil {
+				return err
 			}
-			continue
 		default:
-			slog.Warn("unexpected clone_status state", "state", m["STATE"])
-			return nil
+			return fmt.Errorf("clone not confirmed: unexpected clone_status STATE %q on %s", m["STATE"], c.Host())
 		}
 	}
 }
 
 // WaitForMySQL polls host:port until MySQL accepts connections, with exponential backoff.
-func WaitForMySQL(host string, port int, user, pass string, maxWait time.Duration) error {
+func WaitForMySQL(ctx context.Context, host string, port int, user, pass string, maxWait time.Duration) error {
 	deadline := time.Now().Add(maxWait)
 	delay := 3 * time.Second
 
 	yellow := color.New(color.FgYellow)
 	attempt := 0
 	for time.Now().Before(deadline) {
-		time.Sleep(delay)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
 		if delay < 30*time.Second {
 			delay = min(delay*2, 30*time.Second)
 		}
@@ -231,7 +350,9 @@ func WaitForMySQL(host string, port int, user, pass string, maxWait time.Duratio
 			slog.Debug("reconnect attempt failed", "attempt", attempt, "err", err)
 			continue
 		}
-		pingErr := c.Ping(context.Background())
+		pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		pingErr := c.Ping(pctx)
+		cancel()
 		_ = c.Close()
 		if pingErr == nil {
 			yellow.Fprintf(os.Stderr, "  MySQL is back online ✓\n")
@@ -242,38 +363,66 @@ func WaitForMySQL(host string, port int, user, pass string, maxWait time.Duratio
 	return fmt.Errorf("MySQL on %s:%d did not come back within %s", host, port, maxWait)
 }
 
-// CleanupClone drops clone_user and uninstalls the clone plugin on both servers.
-// Uses its own context so cleanup runs even when the caller's context is cancelled.
-func CleanupClone(_ context.Context, src, dst *Client, srcIP, dstIP string) {
-	cleanCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// CleanupClone removes every clone artifact from both servers: all clone_user
+// accounts (including the one that arrives on dst inside the cloned data) and the
+// clone plugin. It uses its own context so it runs even after Ctrl+C or a timeout.
+// Returns false when something could not be removed.
+func CleanupClone(src, dst *Client) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	srcStmts := []string{
-		"SET sql_log_bin=0",
-		fmt.Sprintf("DROP USER IF EXISTS 'clone_user'@'%s'", dstIP),
-		"UNINSTALL PLUGIN clone",
-		"SET sql_log_bin=1",
+	ok := true
+	for _, c := range []*Client{src, dst} {
+		if err := cleanupCloneOn(ctx, c); err != nil {
+			ok = false
+			color.New(color.FgRed).Fprintf(os.Stderr, "  ✗ cleanup on %s failed: %v\n", c.Host(), err)
+			continue
+		}
+		color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ clone_user dropped, clone plugin uninstalled on %s\n", c.Host())
 	}
-	dstStmts := []string{
-		"SET sql_log_bin=0",
-		fmt.Sprintf("DROP USER IF EXISTS 'clone_user'@'%s'", srcIP),
-		"UNINSTALL PLUGIN clone",
-		"SET sql_log_bin=1",
+	if !ok {
+		color.New(color.FgRed).Fprintf(os.Stderr,
+			"  cleanup is incomplete: remove 'clone_user' and the clone plugin manually (run with -v for the SQL)\n")
 	}
-	for _, s := range srcStmts {
-		slog.Debug(s, "host", src.Host())
+	return ok
+}
+
+func cleanupCloneOn(ctx context.Context, c *Client) error {
+	users, err := c.QueryRows(ctx, "SELECT Host AS h FROM mysql.user WHERE User = 'clone_user'")
+	if err != nil {
+		return fmt.Errorf("list clone_user accounts: %w", err)
 	}
-	if err := src.ExecSession(cleanCtx, srcStmts); err != nil {
-		slog.Debug("cleanup on src", "err", err)
+	plugin, err := c.QueryMap(ctx, "SELECT PLUGIN_STATUS FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME='clone'")
+	if err != nil {
+		return fmt.Errorf("check clone plugin: %w", err)
 	}
-	for _, s := range dstStmts {
-		slog.Debug(s, "host", dst.Host())
+
+	stmts := []string{"SET sql_log_bin=0"}
+	for _, u := range users {
+		stmts = append(stmts, "DROP USER IF EXISTS "+account("clone_user", u["h"]))
 	}
-	if err := dst.ExecSession(cleanCtx, dstStmts); err != nil {
-		slog.Debug("cleanup on dst", "err", err)
+	if plugin != nil {
+		stmts = append(stmts, "UNINSTALL PLUGIN clone")
 	}
-	color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ clone_user dropped on both servers\n")
-	color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ clone plugin uninstalled\n")
+	stmts = append(stmts, "SET sql_log_bin=1")
+
+	for _, s := range stmts {
+		slog.Debug(s, "host", c.Host())
+	}
+	// Right after an interrupted clone the donor sessions are still winding down
+	// and the plugin is reported as in use for a few seconds.
+	for {
+		err := c.ExecSession(ctx, stmts)
+		var mysqlErr *gmysql.MySQLError
+		if !errors.As(err, &mysqlErr) || mysqlErr.Number != erPluginInUse {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 // ── per-stage progress tracker ───────────────────────────────────────────────
@@ -448,8 +597,24 @@ func fmtBytes(b int64) string {
 	}
 }
 
-var rePassword = regexp.MustCompile(`(?i)(BY\s+|PASSWORD=)'[^']*'`)
+// quote returns s as a single-quoted SQL string literal.
+func quote(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `'`, `''`)
+	return "'" + s + "'"
+}
 
+// account returns the 'user'@'host' form of an account name.
+func account(user, host string) string {
+	return quote(user) + "@" + quote(host)
+}
+
+// FormatBytes renders a byte count in human-readable units.
+func FormatBytes(b int64) string { return fmtBytes(b) }
+
+var rePassword = regexp.MustCompile(`(?i)(BY\s+|PASSWORD=)'(?:[^'\\]|''|\\.)*'`)
+
+// maskSQL hides password literals; use it for anything printed or logged.
 func maskSQL(s string) string {
 	return rePassword.ReplaceAllString(s, "${1}'****'")
 }

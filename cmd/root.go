@@ -2,10 +2,12 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -13,8 +15,8 @@ import (
 	"github.com/spf13/viper"
 )
 
-// userSetFromConfig is true when mysql_user was read from the config file.
-// Used by askUser to skip interactive prompting when config already provides a user.
+// userSetFromConfig is true when mysql_user came from the config file or environment.
+// Used by askUser to skip interactive prompting when a user is already provided.
 var userSetFromConfig bool
 
 // Cfg holds values resolved from flags + config file.
@@ -39,6 +41,17 @@ var Cfg struct {
 	Verbose       bool
 	Demo          bool
 	NativeAuth    bool
+}
+
+// singleDst returns the destination for commands that work on exactly one src → dst pair.
+func singleDst() (string, error) {
+	if len(Cfg.Dst) == 0 {
+		return "", fmt.Errorf("--dst is required")
+	}
+	if len(Cfg.Dst) > 1 || strings.Contains(Cfg.Dst[0], ",") {
+		return "", fmt.Errorf("this command works with exactly one destination, got %q", strings.Join(Cfg.Dst, ","))
+	}
+	return Cfg.Dst[0], nil
 }
 
 func srcPort() int {
@@ -111,6 +124,12 @@ Config file: ~/.mysqlctl.yaml
 func Execute() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// The first signal starts a graceful shutdown; restoring the default handlers
+	// lets a second Ctrl+C terminate the process if that shutdown hangs.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 
 	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -137,7 +156,7 @@ func init() {
 	pf.StringVar(&Cfg.ClonePassword, "clone-password", "", "clone_user password")
 	pf.StringVar(&Cfg.ReplUser, "repl-user", "replicator", "replication user name")
 	pf.StringVar(&Cfg.ReplPassword, "repl-password", "", "replication user password")
-	pf.DurationVar(&Cfg.Timeout, "timeout", 12*time.Hour, "MySQL operation timeout")
+	pf.DurationVar(&Cfg.Timeout, "timeout", 12*time.Hour, "overall time limit for clone/switch; a running CLONE is killed when it expires")
 	pf.BoolVar(&Cfg.DryRun, "dry-run", false, "print SQL without executing")
 	pf.BoolVar(&Cfg.JSON, "json", false, "output results as JSON")
 	pf.BoolVarP(&Cfg.Verbose, "verbose", "v", false, "enable debug logging")
@@ -145,6 +164,8 @@ func init() {
 	pf.BoolVar(&Cfg.NativeAuth, "native-auth", false, "use IDENTIFIED WITH mysql_native_password (for MySQL ≤ 8.0)")
 
 	_ = viper.BindPFlag("port", pf.Lookup("port"))
+	_ = viper.BindPFlag("src_port", pf.Lookup("src-port"))
+	_ = viper.BindPFlag("dst_port", pf.Lookup("dst-port"))
 	_ = viper.BindPFlag("mysql_user", pf.Lookup("user"))
 	_ = viper.BindPFlag("src_user", pf.Lookup("src-user"))
 	_ = viper.BindPFlag("dst_user", pf.Lookup("dst-user"))
@@ -167,16 +188,31 @@ func initConfig() {
 	viper.SetEnvPrefix("MYSQLCTL")
 	viper.AutomaticEnv()
 
-	_ = viper.ReadInConfig() // silently ignore missing config
+	if err := viper.ReadInConfig(); err != nil {
+		// Only a missing config is fine; a broken one must not silently fall back to defaults.
+		var notFound viper.ConfigFileNotFoundError
+		if !errors.As(err, &notFound) {
+			fmt.Fprintf(os.Stderr, "error: config file: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	// Pull values from viper into Cfg (flags take priority, already bound above).
 	if !rootCmd.PersistentFlags().Changed("port") {
 		Cfg.Port = viper.GetInt("port")
 	}
+	if !rootCmd.PersistentFlags().Changed("src-port") {
+		Cfg.SrcPort = viper.GetInt("src_port")
+	}
+	if !rootCmd.PersistentFlags().Changed("dst-port") {
+		Cfg.DstPort = viper.GetInt("dst_port")
+	}
 	if !rootCmd.PersistentFlags().Changed("user") {
 		if u := viper.GetString("mysql_user"); u != "" {
 			Cfg.User = u
-			userSetFromConfig = true
+			// GetString also returns the flag default, so check where the value came from.
+			_, fromEnv := os.LookupEnv("MYSQLCTL_MYSQL_USER")
+			userSetFromConfig = viper.InConfig("mysql_user") || fromEnv
 		}
 	}
 	if !rootCmd.PersistentFlags().Changed("src-user") {

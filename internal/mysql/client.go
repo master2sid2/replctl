@@ -80,7 +80,7 @@ func (c *Client) ExecSession(ctx context.Context, queries []string) error {
 	defer conn.Close()
 	for _, q := range queries {
 		if _, err := conn.ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("exec on %s %q: %w", c.cfg.Host, q, err)
+			return fmt.Errorf("exec on %s %q: %w", c.cfg.Host, maskSQL(q), err)
 		}
 	}
 	return nil

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -19,7 +20,9 @@ var switchCmd = &cobra.Command{
 	Short: "Configure GTID replication from source to destination",
 	Long: `Creates a replication user on source, then runs STOP REPLICA / RESET REPLICA ALL /
 CHANGE REPLICATION SOURCE TO ... SOURCE_AUTO_POSITION=1 / START REPLICA on destination.
-Run 'clone' first to sync the data before using this command.`,
+Any replication already configured on destination is replaced, so the same command
+repoints a replica from one source to another.
+Run 'clone' first when the destination has no data yet.`,
 	Example: `  # Basic replication setup
   mysqlctl switch -s db1.example.com -d db2.example.com -u root -p secret \
     --repl-user replicator --repl-password replpass
@@ -29,21 +32,34 @@ Run 'clone' first to sync the data before using this command.`,
     --src-user admin --dst-user dba --src-password p1 --dst-password p2 \
     --repl-user replicator --repl-password replpass
 
+  # Source without TLS
+  mysqlctl switch -s db1 -d db2 --repl-ssl=false --repl-password replpass
+
   # Dry-run to preview SQL
   mysqlctl switch -s db1 -d db2 --dry-run --repl-user replicator --repl-password replpass`,
 	RunE: runSwitch,
 }
 
+var switchFlags struct {
+	SSL bool
+}
+
+func init() {
+	switchCmd.Flags().BoolVar(&switchFlags.SSL, "repl-ssl", true,
+		"encrypt the replication connection (SOURCE_SSL=1); with --repl-ssl=false uses GET_SOURCE_PUBLIC_KEY=1 instead")
+}
+
 func runSwitch(cmd *cobra.Command, _ []string) error {
-	ctx := cmd.Context()
+	ctx, cancel := context.WithTimeout(cmd.Context(), Cfg.Timeout)
+	defer cancel()
 
 	if Cfg.Src == "" {
 		return fmt.Errorf("--src is required")
 	}
-	if len(Cfg.Dst) == 0 {
-		return fmt.Errorf("--dst is required")
+	dst, err := singleDst()
+	if err != nil {
+		return err
 	}
-	dst := Cfg.Dst[0]
 
 	if Cfg.Src == dst {
 		return fmt.Errorf("source and destination must be different hosts")
@@ -132,6 +148,26 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 	info.Printf("Source:      %s (%s)\n", Cfg.Src, srcIP)
 	info.Printf("Destination: %s (%s)\n", dst, dstIP)
 	fmt.Println()
+
+	if !Cfg.DryRun {
+		// Everything is checked before the confirmation: once RESET REPLICA ALL has
+		// run, the previous replication settings of the destination are gone.
+		warnings, err := mysqlpkg.CheckReplicationPrereqs(ctx, srcClient, dstClient)
+		if err != nil {
+			return fmt.Errorf("pre-flight check: %w", err)
+		}
+		current, err := mysqlpkg.GetReplicaStatuses(ctx, dstClient)
+		if err != nil {
+			return err
+		}
+		for _, c := range current {
+			warn.Printf("Current source of %s: %s:%s (IO=%s, SQL=%s) — will be removed\n",
+				dst, c.SourceHost, c.SourcePort, c.IORunning, c.SQLRunning)
+		}
+		for _, w := range warnings {
+			color.New(color.FgRed).Printf("  ! %s\n", w)
+		}
+	}
 	warn.Printf("Replication: %s → %s\n", Cfg.Src, dst)
 	fmt.Println()
 
@@ -140,8 +176,7 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 		scanner := bufio.NewScanner(os.Stdin)
 		scanner.Scan()
 		if answer := strings.TrimSpace(scanner.Text()); answer != "Y" && answer != "y" {
-			fmt.Println("Cancelled.")
-			return nil
+			return errCancelled
 		}
 	}
 
@@ -153,7 +188,7 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 
 	// Step 2: Configure replication on destination.
 	info.Println("[2/2] Configuring replication on destination...")
-	if err := mysqlpkg.ConfigureReplication(ctx, dstClient, srcIP, srcPort(), Cfg.ReplUser, Cfg.ReplPassword, Cfg.DryRun); err != nil {
+	if err := mysqlpkg.ConfigureReplication(ctx, dstClient, srcIP, srcPort(), Cfg.ReplUser, Cfg.ReplPassword, switchFlags.SSL, Cfg.DryRun); err != nil {
 		return fmt.Errorf("configure replication: %w", err)
 	}
 
@@ -161,27 +196,15 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 		return nil
 	}
 
-	// Show status after a brief settling time.
-	info.Println("\nWaiting 10s for replication to start...")
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timeAfter(10 * time.Second):
+	// Replication is only reported as working once both threads actually run.
+	info.Println("\nWaiting for replication to start...")
+	status, runErr := mysqlpkg.WaitReplicaRunning(ctx, dstClient, 30*time.Second)
+	if status != nil {
+		if Cfg.JSON {
+			printLagJSON([]lagResult{{host: dst, status: status}})
+		} else {
+			printReplicaStatus(status)
+		}
 	}
-
-	status, err := mysqlpkg.GetReplicaStatus(ctx, dstClient)
-	if err != nil {
-		return err
-	}
-	if Cfg.JSON {
-		printLagJSON([]lagResult{{host: dst, status: status}})
-	} else {
-		printReplicaStatus(status)
-	}
-	return nil
-}
-
-// timeAfter is a small wrapper so it can be tested without actually sleeping.
-func timeAfter(d time.Duration) <-chan time.Time {
-	return time.After(d)
+	return runErr
 }

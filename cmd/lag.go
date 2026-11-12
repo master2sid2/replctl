@@ -88,7 +88,7 @@ func runLag(cmd *cobra.Command, _ []string) error {
 			fmt.Print("\033[2J\033[H") // clear screen
 			fmt.Printf("mysqlctl lag  —  %s  (interval: %s)\n\n",
 				time.Now().Format("2006-01-02 15:04:05"), lagFlags.Interval)
-			printLagForHosts(ctx, hosts)
+			_ = printLagForHosts(ctx, hosts)
 			select {
 			case <-ctx.Done():
 				return nil
@@ -97,7 +97,9 @@ func runLag(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
-	printLagForHosts(ctx, hosts)
+	if failed := printLagForHosts(ctx, hosts); failed > 0 {
+		return fmt.Errorf("could not query %d of %d host(s)", failed, len(hosts))
+	}
 	return nil
 }
 
@@ -107,8 +109,10 @@ type lagResult struct {
 	err    error
 }
 
-func printLagForHosts(ctx context.Context, hosts []string) {
-	results := make([]lagResult, len(hosts))
+// printLagForHosts queries all hosts in parallel and prints one entry per replication
+// channel. It returns the number of hosts that could not be queried.
+func printLagForHosts(ctx context.Context, hosts []string) int {
+	perHost := make([][]lagResult, len(hosts))
 	var wg sync.WaitGroup
 	for i, h := range hosts {
 		wg.Add(1)
@@ -124,32 +128,52 @@ func printLagForHosts(ctx context.Context, hosts []string) {
 				Timeout:  10 * time.Second,
 			})
 			if err != nil {
-				results[idx] = lagResult{host: host, err: err}
+				perHost[idx] = []lagResult{{host: host, err: err}}
 				return
 			}
 			defer c.Close()
-			s, err := mysqlpkg.GetReplicaStatus(qctx, c)
-			results[idx] = lagResult{host: host, status: s, err: err}
+			all, err := mysqlpkg.GetReplicaStatuses(qctx, c)
+			switch {
+			case err != nil:
+				perHost[idx] = []lagResult{{host: host, err: err}}
+			case len(all) == 0:
+				perHost[idx] = []lagResult{{host: host, status: &mysqlpkg.ReplicaStatus{Host: host}}}
+			default:
+				for _, s := range all {
+					perHost[idx] = append(perHost[idx], lagResult{host: host, status: s})
+				}
+			}
 		}(i, h)
 	}
 	wg.Wait()
 
+	var results []lagResult
+	failed := 0
+	for _, rs := range perHost {
+		if rs[0].err != nil {
+			failed++
+		}
+		results = append(results, rs...)
+	}
+
 	if Cfg.JSON {
 		printLagJSON(results)
-		return
+		return failed
 	}
 
 	if len(hosts) == 1 {
-		r := results[0]
-		if r.err != nil {
-			color.New(color.FgRed).Fprintf(os.Stderr, "error querying %s: %v\n", r.host, r.err)
-			return
+		for _, r := range results {
+			if r.err != nil {
+				color.New(color.FgRed).Fprintf(os.Stderr, "error querying %s: %v\n", r.host, r.err)
+				continue
+			}
+			printReplicaStatus(r.status)
 		}
-		printReplicaStatus(r.status)
-		return
+		return failed
 	}
 
 	printLagTable(results)
+	return failed
 }
 
 func printReplicaStatus(s *mysqlpkg.ReplicaStatus) {
@@ -158,6 +182,9 @@ func printReplicaStatus(s *mysqlpkg.ReplicaStatus) {
 	yellow := color.New(color.FgYellow).SprintFunc()
 
 	fmt.Printf("\n  Host: %s\n", s.Host)
+	if s.Channel != "" {
+		fmt.Printf("  Channel: %s\n", s.Channel)
+	}
 
 	if !s.IsConfigured {
 		fmt.Printf("  %s\n", yellow("replication not configured"))
@@ -224,13 +251,18 @@ func printLagTable(results []lagResult) {
 		if l := s.SecondsBehindInt(); l >= 0 {
 			lag = strconv.Itoa(l)
 		}
-		table.Append([]string{s.Host, s.IORunning, s.SQLRunning, lag, s.SourceHost, s.LastError})
+		host := s.Host
+		if s.Channel != "" {
+			host += " [" + s.Channel + "]"
+		}
+		table.Append([]string{host, s.IORunning, s.SQLRunning, lag, s.SourceHost, s.LastError})
 	}
 	table.Render()
 }
 
 type lagJSON struct {
 	Host          string `json:"host"`
+	Channel       string `json:"channel,omitempty"`
 	SourceHost    string `json:"source_host,omitempty"`
 	IORunning     bool   `json:"io_running"`
 	SQLRunning    bool   `json:"sql_running"`
@@ -248,6 +280,7 @@ func printLagJSON(results []lagResult) {
 			j.Error = r.err.Error()
 		} else if r.status != nil {
 			s := r.status
+			j.Channel = s.Channel
 			j.SourceHost = s.SourceHost
 			j.IORunning = s.IORunningBool()
 			j.SQLRunning = s.SQLRunningBool()

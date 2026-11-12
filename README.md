@@ -9,7 +9,7 @@ CLI tool for MySQL 8.0+ cloning and replication management.
 | Feature | Description |
 |---------|-------------|
 | `clone` | MySQL Clone Plugin: installs plugin, creates temporary users, runs `CLONE INSTANCE FROM` with live per-stage progress and ETA, waits for restart, verifies clone status, cleans up |
-| `switch` | GTID replication setup: recreates replication user, runs `CHANGE REPLICATION SOURCE TO ... SOURCE_AUTO_POSITION=1, SOURCE_SSL=1` |
+| `switch` | GTID replication setup or repointing to another source: pre-flight checks, recreates replication user, runs `CHANGE REPLICATION SOURCE TO ... SOURCE_AUTO_POSITION=1`, confirms both threads run |
 | `lag` | Replication status with color output; supports multiple replicas simultaneously |
 | `lag --watch` | Continuous status refresh (like `watch`) |
 | `--dry-run` | Prints SQL without connecting to servers; passwords are masked as `****` |
@@ -18,7 +18,7 @@ CLI tool for MySQL 8.0+ cloning and replication management.
 | `--native-auth` | `IDENTIFIED WITH mysql_native_password` for MySQL ≤ 8.0 |
 | Config file | Defaults from `~/.mysqlctl.yaml` |
 | Passwords | Interactive input via `term.ReadPassword` — not visible in `ps` or shell history |
-| Ctrl+C | Graceful shutdown: cleanup runs even after cancellation |
+| Ctrl+C / `--timeout` | A running `CLONE` is killed on the destination, then cleanup runs. A second Ctrl+C exits immediately |
 
 ---
 
@@ -43,6 +43,8 @@ Create `~/.mysqlctl.yaml` to avoid repeating common flags:
 
 ```yaml
 port: 3306
+src_port: 0            # overrides port for source only
+dst_port: 0            # overrides port for destination only
 mysql_user: root       # set here to skip the interactive username prompt
 src_user: ""           # overrides user for source only
 dst_user: ""           # overrides user for destination only
@@ -55,7 +57,8 @@ repl_password: ""
 timeout: 12h
 ```
 
-Value priority: **CLI flag > environment variable > config file > default**.
+Value priority: **CLI flag > environment variable > config file > default**.  
+A config file that cannot be parsed is an error — the tool does not fall back to defaults.
 
 Environment variables use the `MYSQLCTL_` prefix:
 ```bash
@@ -70,7 +73,9 @@ export MYSQLCTL_CLONE_PASSWORD=clonepass
 ### `clone` — clone a database
 
 Full data copy from source to destination via MySQL Clone Plugin.  
-After cloning, the destination automatically restarts — the tool waits with exponential backoff and verifies `clone_status.STATE = Completed`.
+After cloning, the destination automatically restarts — the tool waits with exponential backoff and verifies `clone_status`.
+
+Success is reported only when `clone_status` on the destination holds a record of the clone **started by this run** with `STATE = Completed`. A dropped connection, an empty table, a record left by an earlier clone or an unreadable status all end with an error and a non-zero exit code.
 
 ```bash
 mysqlctl clone -s db1.example.com -d db2.example.com
@@ -91,12 +96,20 @@ mysqlctl clone -s db1 -d db2 --dry-run --clone-password pass
 
 **Steps:**
 1. Parallel connectivity check on both servers
-2. Install clone plugin (if not active)
-3. Create temporary `clone_user` on both servers
-4. `CLONE INSTANCE FROM` with live per-stage progress (ETA, size, elapsed time)
-5. Wait for MySQL restart on destination
-6. Verify `performance_schema.clone_status`
-7. Drop `clone_user` and uninstall plugin
+2. Refuse if both hosts are the same instance (`server_uuid`); show what the destination holds now (schemas, size, connected replicas) and source properties that affect it afterwards (enabled events, source being a replica)
+3. Confirmation
+4. Install clone plugin (if not active)
+5. Create temporary `clone_user` on both servers (a leftover one is dropped first)
+6. `CLONE INSTANCE FROM` with live per-stage progress (ETA, size, elapsed time)
+7. Wait for MySQL restart on destination
+8. Verify `performance_schema.clone_status`
+9. Drop every `clone_user` account and uninstall the plugin on both servers
+
+Cleanup (step 9) also runs when the clone fails, is interrupted or times out, and reports per server whether it succeeded. Exactly one `--dst` is accepted.
+
+**Interrupting.** `CLONE` drops the destination data as its first stage, so after Ctrl+C or `--timeout` the destination is left incomplete and must be cloned again. The tool kills the `CLONE` thread on the destination (closing the client connection alone would leave it running) and says so.
+
+**mysqld without a supervisor.** If mysqld on the destination is not managed by systemd/mysqld_safe it cannot restart itself (error 3707) and shuts down. The tool tells you to start it manually and keeps waiting (up to 5 minutes), then verifies as usual.
 
 ```
 [1/4] Checking clone plugin...
@@ -119,10 +132,10 @@ mysqlctl clone -s db1 -d db2 --dry-run --clone-password pass
   Waiting for restart...
   MySQL is back online ✓
 Verifying clone status...
-  ✓ STATE = Completed
+  ✓ STATE = Completed (source 10.0.0.1:3306)
 Total time: 16m59s
-  ✓ clone_user dropped on both servers
-  ✓ clone plugin uninstalled
+  ✓ clone_user dropped, clone plugin uninstalled on db1.example.com
+  ✓ clone_user dropped, clone plugin uninstalled on db2.example.com
 
 Done. Destination database is a fresh copy of source.
 ```
@@ -131,7 +144,7 @@ Done. Destination database is a fresh copy of source.
 
 ### `switch` — configure replication
 
-Run **after** `clone`, once data on the replica is up to date.
+Run **after** `clone`, or to repoint an existing replica to another source (for example after one of the replicas has been promoted). Whatever replication is configured on the destination is removed with `RESET REPLICA ALL` and replaced.
 
 ```bash
 mysqlctl switch -s db1.example.com -d db2.example.com
@@ -139,7 +152,22 @@ mysqlctl switch -s db1.example.com -d db2.example.com
 # Different credentials
 mysqlctl switch -s db1 -d db2 --src-user admin --dst-user dba \
   --src-password p1 --dst-password p2 --repl-password replpass
+
+# Source without TLS
+mysqlctl switch -s db1 -d db2 --repl-ssl=false --repl-password replpass
 ```
+
+**Pre-flight checks** run before the confirmation and before anything is changed:
+
+| Check | Result |
+|-------|--------|
+| Same instance (`server_uuid`), equal or zero `server_id` | error |
+| `gtid_mode` not `ON` on either server, binary log disabled on source | error |
+| Source has purged binary logs the destination still needs (`gtid_purged`) | error — re-clone |
+| Destination has transactions the source does not have | warning, shown before the confirmation |
+| `read_only` is OFF on destination | warning |
+
+The current source of the destination, if any, is shown before the confirmation.
 
 Runs on source:
 ```sql
@@ -161,9 +189,9 @@ START REPLICA;
 ```
 
 `DROP USER IF EXISTS` ensures the password is always updated on repeated runs.  
-`SOURCE_SSL=1` is required for `caching_sha2_password` (MySQL 8.0 default) without a pre-shared RSA key.
+`SOURCE_SSL=1` is the default: `caching_sha2_password` (MySQL 8.0 default) needs either TLS or the source's RSA public key. With `--repl-ssl=false` the tool sends `SOURCE_SSL=0, GET_SOURCE_PUBLIC_KEY=1` instead.
 
-After setup, automatically displays replication status.
+After setup the tool waits up to 30 seconds for both replication threads to run and prints the status. If they do not start, the IO/SQL thread error is shown and the exit code is non-zero.
 
 ---
 
@@ -183,6 +211,8 @@ mysqlctl lag -d replica1,replica2 --watch --interval 3s
 # JSON output for scripts/monitoring
 mysqlctl lag -d replica2.example.com --json
 ```
+
+Every replication channel of a host is shown (multi-source replicas get one entry per channel). `Last Error` combines the IO and SQL thread errors. Without `--watch`, the exit code is non-zero when a host could not be queried.
 
 **Single replica output:**
 ```
@@ -224,13 +254,20 @@ mysqlctl lag -d replica2.example.com --json
       --clone-password string   clone_user password
       --repl-user string        replication user name (default "replicator")
       --repl-password string    replication user password
-      --timeout duration        operation timeout (default 12h)
+      --timeout duration        overall time limit for clone/switch; a running CLONE is killed when it expires (default 12h)
       --native-auth             IDENTIFIED WITH mysql_native_password (MySQL ≤ 8.0)
       --dry-run                 print SQL without executing
       --json                    JSON output
       --demo                    demo mode (simulate without real MySQL)
   -v, --verbose                 debug logging (SQL statements, timestamps)
 ```
+
+`switch` only:
+```
+      --repl-ssl                encrypt the replication connection (default true)
+```
+
+Passwords are masked as `****` everywhere: dry-run, `-v` logs and error messages.
 
 ---
 
@@ -245,13 +282,15 @@ mysqlctl clone -s db1 -d db2 --clone-password x --dry-run
 ```
 [dry-run] -- SRC (192.168.1.10)
   SET sql_log_bin=0;
-  CREATE USER IF NOT EXISTS 'clone_user'@'192.168.1.11' IDENTIFIED BY '****';
+  DROP USER IF EXISTS 'clone_user'@'192.168.1.11';
+  CREATE USER 'clone_user'@'192.168.1.11' IDENTIFIED BY '****';
   GRANT BACKUP_ADMIN ON *.* TO 'clone_user'@'192.168.1.11';
   SET sql_log_bin=1;
 
 [dry-run] -- DST (192.168.1.11)
   SET sql_log_bin=0;
-  CREATE USER IF NOT EXISTS 'clone_user'@'192.168.1.10' IDENTIFIED BY '****';
+  DROP USER IF EXISTS 'clone_user'@'192.168.1.10';
+  CREATE USER 'clone_user'@'192.168.1.10' IDENTIFIED BY '****';
   GRANT CLONE_ADMIN ON *.* TO 'clone_user'@'192.168.1.10';
   SET sql_log_bin=1;
 
@@ -322,8 +361,9 @@ mysqlctl lag -d db2.prod.example.com --watch --interval 5s
 └── internal/
     ├── mysql/
     │   ├── client.go  # DB client, DSN, ReadTimeout, ExecSession
-    │   ├── clone.go   # clone plugin, per-stage progress with spinner/ETA, cleanup
-    │   └── repl.go    # replication status, CHANGE SOURCE
+    │   ├── clone.go   # clone plugin, per-stage progress with spinner/ETA, verification, cleanup
+    │   ├── inspect.go # server settings and data summary for pre-flight checks
+    │   └── repl.go    # replication status, pre-flight checks, CHANGE SOURCE
     └── dns/
         └── resolve.go # hostname → IP resolution
 ```
