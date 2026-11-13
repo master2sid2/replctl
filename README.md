@@ -1,5 +1,10 @@
 # replctl
 
+[![CI](https://github.com/master2sid2/replctl/actions/workflows/ci.yml/badge.svg)](https://github.com/master2sid2/replctl/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/master2sid2/replctl)](https://github.com/master2sid2/replctl/releases)
+[![Go](https://img.shields.io/github/go-mod/go-version/master2sid2/replctl)](go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Build and maintain MySQL replicas from the command line:
 
 - **`clone`** — copy a source server onto a destination with the MySQL Clone
@@ -431,6 +436,10 @@ make lint       # go vet and gofmt check
 make install    # copy to /usr/local/bin (PREFIX=... to change)
 make dist       # release binaries for Linux, macOS and Windows in dist/
 ```
+
+Releases on GitHub are built by [GoReleaser](https://goreleaser.com) in GitHub
+Actions when a `v*` tag is pushed; the tag must match the `VERSION` file.
+`make dist` builds the same binaries locally.
 
 ## Project layout
 

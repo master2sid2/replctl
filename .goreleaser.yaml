@@ -1,0 +1,42 @@
+# Release builds for GitHub, run by .github/workflows/release.yml on a v* tag.
+# The same binaries can be built locally with "make dist" (used for GitLab).
+version: 2
+
+project_name: replctl
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/master2sid2/replctl/cmd.version={{ .Version }}
+      - -X github.com/master2sid2/replctl/cmd.commit={{ .ShortCommit }}
+      - -X github.com/master2sid2/replctl/cmd.date={{ time "2006-01-02" }}
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: windows
+        goarch: arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - formats: [binary]
+    name_template: "{{ .ProjectName }}-v{{ .Version }}-{{ .Os }}-{{ .Arch }}"
+
+checksum:
+  name_template: SHA256SUMS
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
+      - "^test:"
+
+release:
+  footer: |
+    ### Install
+    Download the binary for your platform, check it against `SHA256SUMS`, make it executable and put it on your `PATH`, or run `go install github.com/master2sid2/replctl@{{ .Tag }}`.

@@ -206,8 +206,11 @@ func RunClone(ctx context.Context, dst, mon *Client, srcIP string, srcPort int, 
 			tracker.spin()
 
 		case <-ctx.Done():
+			// Give the CLONE statement a moment to notice the cancellation; its
+			// error says nothing new, the thread is killed below either way.
 			select {
-			case <-cloneErrCh:
+			case err := <-cloneErrCh:
+				slog.Debug("clone statement ended after cancellation", "err", err)
 			case <-time.After(10 * time.Second):
 			}
 			return interrupted()

@@ -192,7 +192,7 @@ func demoSwitch(ctx context.Context, src, dst string) error {
 	for _, step := range []string{
 		"STOP REPLICA",
 		"RESET REPLICA ALL",
-		fmt.Sprintf("CHANGE REPLICATION SOURCE TO SOURCE_HOST='10.0.0.1', SOURCE_AUTO_POSITION=1"),
+		"CHANGE REPLICATION SOURCE TO SOURCE_HOST='10.0.0.1', SOURCE_AUTO_POSITION=1",
 		"START REPLICA",
 	} {
 		demoSleep(ctx, 250*time.Millisecond)
