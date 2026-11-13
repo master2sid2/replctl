@@ -13,6 +13,7 @@ import (
 
 	"github.com/fatih/color"
 	gmysql "github.com/go-sql-driver/mysql"
+	"golang.org/x/term"
 )
 
 // EnsureClonePlugin installs the clone plugin on c if it is not already active.
@@ -43,47 +44,42 @@ func identifiedBy(password string, nativeAuth bool) string {
 	return "IDENTIFIED BY " + quote(password)
 }
 
-// CreateCloneUsers creates clone_user on src (BACKUP_ADMIN) and dst (CLONE_ADMIN).
-// A clone_user left over from an earlier run is dropped first so the password always matches.
-func CreateCloneUsers(ctx context.Context, src, dst *Client, srcIP, dstIP, clonePass string, dryRun, nativeAuth bool) error {
-	srcStmts := []string{
+// CreateCloneUser creates clone_user@dstIP with BACKUP_ADMIN on the donor (src).
+// The recipient needs no extra account: CLONE runs there as the operator's own
+// user, which must have CLONE_ADMIN. A clone_user left over from an earlier run
+// is dropped first so the password always matches.
+func CreateCloneUser(ctx context.Context, src *Client, srcIP, dstIP, clonePass string, dryRun, nativeAuth bool) error {
+	stmts := []string{
 		"SET sql_log_bin=0",
 		"DROP USER IF EXISTS " + account("clone_user", dstIP),
 		fmt.Sprintf("CREATE USER %s %s", account("clone_user", dstIP), identifiedBy(clonePass, nativeAuth)),
 		"GRANT BACKUP_ADMIN ON *.* TO " + account("clone_user", dstIP),
 		"SET sql_log_bin=1",
 	}
-	dstStmts := []string{
-		"SET sql_log_bin=0",
-		"DROP USER IF EXISTS " + account("clone_user", srcIP),
-		fmt.Sprintf("CREATE USER %s %s", account("clone_user", srcIP), identifiedBy(clonePass, nativeAuth)),
-		"GRANT CLONE_ADMIN ON *.* TO " + account("clone_user", srcIP),
-		"SET sql_log_bin=1",
-	}
-
 	if dryRun {
-		printDryRun("SRC ("+srcIP+")", srcStmts)
-		printDryRun("DST ("+dstIP+")", dstStmts)
+		printDryRun("SRC ("+srcIP+")", stmts)
 		return nil
 	}
-
-	for _, s := range srcStmts {
+	for _, s := range stmts {
 		slog.Debug(maskSQL(s), "host", src.Host())
 	}
-	if err := src.ExecSession(ctx, srcStmts); err != nil {
+	if err := src.ExecSession(ctx, stmts); err != nil {
 		return fmt.Errorf("clone_user on src: %w", err)
 	}
 	color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ clone_user@%s created on %s (BACKUP_ADMIN)\n", dstIP, src.Host())
-
-	for _, s := range dstStmts {
-		slog.Debug(maskSQL(s), "host", dst.Host())
-	}
-	if err := dst.ExecSession(ctx, dstStmts); err != nil {
-		return fmt.Errorf("clone_user on dst: %w", err)
-	}
-	color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ clone_user@%s created on %s (CLONE_ADMIN)\n", srcIP, dst.Host())
 	return nil
 }
+
+// CloneError is returned by RunClone when the CLONE did not finish.
+type CloneError struct {
+	Err error
+	// DataDropped is false only when it is known that the DROP DATA stage never
+	// started, i.e. the destination still holds its previous data.
+	DataDropped bool
+}
+
+func (e *CloneError) Error() string { return e.Err.Error() }
+func (e *CloneError) Unwrap() error { return e.Err }
 
 const (
 	// erRestartFailed: CLONE copied the data but mysqld could not restart itself
@@ -145,19 +141,28 @@ func RunClone(ctx context.Context, dst, mon *Client, srcIP string, srcPort int, 
 	}()
 
 	tracker := newCloneTracker()
+	// clone_progress keeps the rows of the previous clone until a new one
+	// reaches each stage, so only stages begun by this run are looked at.
+	progressQuery := cloneProgressQuery + " WHERE BEGIN_TIME >= FROM_UNIXTIME(" + since + ")"
 	poll := func() {
 		pctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if rows, err := mon.QueryRows(pctx, cloneProgressQuery); err == nil {
+		if rows, err := mon.QueryRows(pctx, progressQuery); err == nil {
 			tracker.update(rows)
 		}
 	}
+	failed := func(err error) (string, error) {
+		return since, &CloneError{Err: err, DataDropped: tracker.dataDropped()}
+	}
 	interrupted := func() (string, error) {
-		fmt.Fprintf(os.Stderr, "\r\033[K")
+		tracker.clearLine()
 		killClone(mon, connID)
-		return since, fmt.Errorf(
-			"clone interrupted (%w): destination %s is left with INCOMPLETE data, re-run clone",
-			ctx.Err(), dst.Host())
+		poll()
+		state := "is left with INCOMPLETE data, re-run clone"
+		if !tracker.dataDropped() {
+			state = "still holds its previous data"
+		}
+		return failed(fmt.Errorf("clone interrupted (%w): destination %s %s", ctx.Err(), dst.Host(), state))
 	}
 
 	dataTicker := time.NewTicker(2 * time.Second)
@@ -173,19 +178,19 @@ func RunClone(ctx context.Context, dst, mon *Client, srcIP string, srcPort int, 
 			}
 			// Final refresh so we don't miss the last completed stage.
 			poll()
-			fmt.Fprintf(os.Stderr, "\r\033[K") // clear spinner line
+			tracker.clearLine()
 
-			var mysqlErr *gmysql.MySQLError
-			if errors.As(err, &mysqlErr) {
+			if mysqlErr, ok := errors.AsType[*gmysql.MySQLError](err); ok {
 				if mysqlErr.Number == erRestartFailed {
 					// The data is in place; the clone completes once mysqld is started
 					// again, so let the caller wait for it and verify as usual.
-					color.New(color.FgRed).Fprintf(os.Stderr,
-						"  ! mysqld on %s cannot restart itself (not managed by systemd/mysqld_safe) and has shut down.\n"+
-							"    Start it manually now to finish the clone.\n", dst.Host())
+					color.New(color.FgYellow).Fprintf(os.Stderr,
+						"  ! mysqld on %s has shut down to finish the clone but cannot restart by itself.\n"+
+							"    If no service manager (systemd, Docker restart policy) starts it again, start it manually.\n",
+						dst.Host())
 					return since, nil
 				}
-				return since, fmt.Errorf("clone MySQL error %d: %s", mysqlErr.Number, mysqlErr.Message)
+				return failed(fmt.Errorf("clone MySQL error %d: %s", mysqlErr.Number, mysqlErr.Message))
 			}
 			if err != nil {
 				// Usually MySQL restarting after the clone, but may also be a network
@@ -218,8 +223,7 @@ func killClone(mon *Client, connID int64) {
 	kill := fmt.Sprintf("KILL %d", connID)
 	slog.Debug(kill, "host", mon.Host())
 	err := mon.ExecOne(ctx, kill)
-	var mysqlErr *gmysql.MySQLError
-	if err == nil || (errors.As(err, &mysqlErr) && mysqlErr.Number == 1094) { // 1094: unknown thread id
+	if mysqlErr, ok := errors.AsType[*gmysql.MySQLError](err); err == nil || (ok && mysqlErr.Number == 1094) { // 1094: unknown thread id
 		color.New(color.FgYellow).Fprintf(os.Stderr, "  ✓ CLONE stopped on %s\n", mon.Host())
 		return
 	}
@@ -257,8 +261,7 @@ FROM performance_schema.clone_status ORDER BY ID DESC LIMIT 1`, since)
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			var mysqlErr *gmysql.MySQLError
-			if errors.As(err, &mysqlErr) && mysqlErr.Number == erNoSuchTable && !pluginTried {
+			if mysqlErr, ok := errors.AsType[*gmysql.MySQLError](err); ok && mysqlErr.Number == erNoSuchTable && !pluginTried {
 				// The plugin is not loaded after the restart (it was not registered in
 				// the cloned mysql.plugin); load it to read the persisted status.
 				pluginTried = true
@@ -344,12 +347,7 @@ func WaitForMySQL(ctx context.Context, host string, port int, user, pass string,
 			fmt.Fprintf(os.Stderr, "  Waiting for restart... (%d)\n", attempt-1)
 		}
 
-		cfg := Config{Host: host, Port: port, User: user, Password: pass, Timeout: 5 * time.Second}
-		c, err := NewClient(cfg)
-		if err != nil {
-			slog.Debug("reconnect attempt failed", "attempt", attempt, "err", err)
-			continue
-		}
+		c := NewClient(Config{Host: host, Port: port, User: user, Password: pass, Timeout: 5 * time.Second})
 		pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		pingErr := c.Ping(pctx)
 		cancel()
@@ -413,8 +411,7 @@ func cleanupCloneOn(ctx context.Context, c *Client) error {
 	// and the plugin is reported as in use for a few seconds.
 	for {
 		err := c.ExecSession(ctx, stmts)
-		var mysqlErr *gmysql.MySQLError
-		if !errors.As(err, &mysqlErr) || mysqlErr.Number != erPluginInUse {
+		if mysqlErr, ok := errors.AsType[*gmysql.MySQLError](err); !ok || mysqlErr.Number != erPluginInUse {
 			return err
 		}
 		select {
@@ -437,28 +434,49 @@ type cloneTracker struct {
 	spinIdx   int
 	stageSeen map[string]time.Time
 	lastRows  []map[string]string
+	polled    bool // at least one progress query succeeded
+	dropped   bool // the DROP DATA stage has begun
+	tty       bool // stderr is a terminal: animate in place
+	lastLog   time.Time
 }
 
 func newCloneTracker() *cloneTracker {
 	return &cloneTracker{
 		printed:   make(map[string]bool),
 		stageSeen: make(map[string]time.Time),
+		tty:       term.IsTerminal(int(os.Stderr.Fd())),
+		lastLog:   time.Now(), // first log line after a minute, once there is progress to show
+	}
+}
+
+// dataDropped reports whether the destination may have lost its data. Without
+// a single successful progress query nothing is known, so assume the worst.
+func (t *cloneTracker) dataDropped() bool { return t.dropped || !t.polled }
+
+// clearLine removes the spinner line on a terminal.
+func (t *cloneTracker) clearLine() {
+	if t.tty {
+		fmt.Fprint(os.Stderr, "\r\033[K")
 	}
 }
 
 // update processes a fresh snapshot: prints newly completed stages, then renders spinner.
 func (t *cloneTracker) update(rows []map[string]string) {
 	t.lastRows = rows
+	t.polled = true
 	green := color.New(color.FgGreen)
 
 	for _, row := range rows {
 		name := row["STAGE"]
+		if name == "DROP DATA" && row["STATE"] != "Not Started" {
+			t.dropped = true
+		}
 		if row["STATE"] == "Completed" && !t.printed[name] {
 			t.printed[name] = true
 			dur := parseStageDuration(row["BEGIN_TIME"], row["END_TIME"])
 			bytes, _ := strconv.ParseInt(row["DATA"], 10, 64)
 
-			fmt.Fprintf(os.Stderr, "\r\033[K")
+			t.clearLine()
 			if bytes > 0 {
 				green.Fprintf(os.Stderr, "  ✓ %-12s  %-10s  %s\n",
 					name, fmtDur(dur), fmtBytes(bytes))
@@ -506,8 +524,13 @@ func (t *cloneTracker) renderSpinner() {
 				fmtBytes(elp), fmtBytes(est), pct*100, eta)
 		}
 
-		fmt.Fprintf(os.Stderr, "\r  %s %-12s  %-8s%s    ",
-			spin, name, fmtDur(elapsed), extra)
+		if t.tty {
+			fmt.Fprintf(os.Stderr, "\r  %s %-12s  %-8s%s    ", spin, name, fmtDur(elapsed), extra)
+		} else if time.Since(t.lastLog) >= time.Minute {
+			// Logs get a plain line once a minute instead of an animation.
+			t.lastLog = time.Now()
+			fmt.Fprintf(os.Stderr, "  … %-12s  %-8s%s\n", name, fmtDur(elapsed), extra)
+		}
 		return
 	}
 }

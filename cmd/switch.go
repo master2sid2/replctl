@@ -1,18 +1,15 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/fatih/color"
-	"github.com/local/mysqlctl/internal/dns"
-	mysqlpkg "github.com/local/mysqlctl/internal/mysql"
 	"github.com/spf13/cobra"
+
+	mysqlpkg "github.com/master2sid2/replctl/internal/mysql"
 )
 
 var switchCmd = &cobra.Command{
@@ -24,19 +21,19 @@ Any replication already configured on destination is replaced, so the same comma
 repoints a replica from one source to another.
 Run 'clone' first when the destination has no data yet.`,
 	Example: `  # Basic replication setup
-  mysqlctl switch -s db1.example.com -d db2.example.com -u root -p secret \
+  replctl switch -s db1.example.com -d db2.example.com -u root \
     --repl-user replicator --repl-password replpass
 
   # Source and destination on different ports with different credentials
-  mysqlctl switch -s db1 -d db2 --src-port 3307 --dst-port 3308 \
+  replctl switch -s db1 -d db2 --src-port 3307 --dst-port 3308 \
     --src-user admin --dst-user dba --src-password p1 --dst-password p2 \
     --repl-user replicator --repl-password replpass
 
   # Source without TLS
-  mysqlctl switch -s db1 -d db2 --repl-ssl=false --repl-password replpass
+  replctl switch -s db1 -d db2 --repl-ssl=false --repl-password replpass
 
   # Dry-run to preview SQL
-  mysqlctl switch -s db1 -d db2 --dry-run --repl-user replicator --repl-password replpass`,
+  replctl switch -s db1 -d db2 --dry-run --repl-user replicator --repl-password replpass`,
 	RunE: runSwitch,
 }
 
@@ -53,90 +50,30 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 	ctx, cancel := context.WithTimeout(cmd.Context(), Cfg.Timeout)
 	defer cancel()
 
-	if Cfg.Src == "" {
-		return fmt.Errorf("--src is required")
-	}
-	dst, err := singleDst()
+	dst, err := pairDst()
 	if err != nil {
 		return err
 	}
-
-	if Cfg.Src == dst {
-		return fmt.Errorf("source and destination must be different hosts")
-	}
-
 	if Cfg.Demo {
 		return demoSwitch(ctx, Cfg.Src, dst)
 	}
 
-	// Prompt for credentials not set via flag or config.
-	if err := askUser(&Cfg.User, cmd.Root().PersistentFlags().Changed("user") || userSetFromConfig); err != nil {
+	if err := promptCredentials(cmd, true, true); err != nil {
 		return err
-	}
-	if srcPassword() == "" || dstPassword() == "" {
-		if err := askPassword(&Cfg.Password, "MySQL password ("+Cfg.User+")"); err != nil {
-			return err
-		}
 	}
 	if err := requirePassword(&Cfg.ReplPassword, "Replication user password", "repl-password"); err != nil {
 		return err
 	}
 
-	var (
-		srcIP, dstIP string
-		resolveErr   [2]error
-		wg           sync.WaitGroup
-	)
-	wg.Add(2)
-	go func() { defer wg.Done(); srcIP, resolveErr[0] = dns.Resolve(Cfg.Src) }()
-	go func() { defer wg.Done(); dstIP, resolveErr[1] = dns.Resolve(dst) }()
-	wg.Wait()
-	if resolveErr[0] != nil {
-		return fmt.Errorf("resolve src: %w", resolveErr[0])
-	}
-	if resolveErr[1] != nil {
-		return fmt.Errorf("resolve dst: %w", resolveErr[1])
+	srcIP, dstIP, err := addresses(dst)
+	if err != nil {
+		return err
 	}
 
 	var srcClient, dstClient *mysqlpkg.Client
-
 	if !Cfg.DryRun {
-		var connErr [2]error
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: Cfg.Src, User: srcUser(), Password: srcPassword(), Port: srcPort(), Timeout: 30 * time.Second})
-			if err != nil {
-				connErr[0] = err
-				return
-			}
-			if err := c.Ping(ctx); err != nil {
-				c.Close()
-				connErr[0] = fmt.Errorf("ping %s: %w", Cfg.Src, err)
-				return
-			}
-			srcClient = c
-		}()
-		go func() {
-			defer wg.Done()
-			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: dst, User: dstUser(), Password: dstPassword(), Port: dstPort(), Timeout: 30 * time.Second})
-			if err != nil {
-				connErr[1] = err
-				return
-			}
-			if err := c.Ping(ctx); err != nil {
-				c.Close()
-				connErr[1] = fmt.Errorf("ping %s: %w", dst, err)
-				return
-			}
-			dstClient = c
-		}()
-		wg.Wait()
-		if connErr[0] != nil {
-			return connErr[0]
-		}
-		if connErr[1] != nil {
-			return connErr[1]
+		if srcClient, dstClient, err = connectPair(ctx, dst); err != nil {
+			return err
 		}
 		defer srcClient.Close()
 		defer dstClient.Close()
@@ -172,11 +109,8 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 	fmt.Println()
 
 	if !Cfg.DryRun {
-		fmt.Print("Start replication? (Y/y to confirm): ")
-		scanner := bufio.NewScanner(os.Stdin)
-		scanner.Scan()
-		if answer := strings.TrimSpace(scanner.Text()); answer != "Y" && answer != "y" {
-			return errCancelled
+		if err := confirm("Start replication?"); err != nil {
+			return err
 		}
 	}
 
@@ -193,6 +127,7 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 	}
 
 	if Cfg.DryRun {
+		info.Println("\nDry run: nothing was changed.")
 		return nil
 	}
 
@@ -201,7 +136,7 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 	status, runErr := mysqlpkg.WaitReplicaRunning(ctx, dstClient, 30*time.Second)
 	if status != nil {
 		if Cfg.JSON {
-			printLagJSON([]lagResult{{host: dst, status: status}})
+			printLagJSON(os.Stdout, []lagResult{{host: dst, status: status}})
 		} else {
 			printReplicaStatus(status)
 		}

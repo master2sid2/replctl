@@ -4,14 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/fatih/color"
-	mysqlpkg "github.com/local/mysqlctl/internal/mysql"
+	mysqlpkg "github.com/master2sid2/replctl/internal/mysql"
 	"github.com/olekukonko/tablewriter"
 	"github.com/spf13/cobra"
 )
@@ -24,22 +24,22 @@ var lagFlags struct {
 var lagCmd = &cobra.Command{
 	Use:   "lag",
 	Short: "Show replication lag and status",
-	Long: `Connects to one or more replica hosts and prints replication status.`,
+	Long:  `Connects to one or more replica hosts and prints replication status.`,
 	Example: `  # Single replica
-  mysqlctl lag -d slave1.example.com -u root -p secret
+  replctl lag -d slave1.example.com
 
   # Multiple replicas (repeat flag or comma-separate)
-  mysqlctl lag -d slave1 -d slave2 -d slave3
-  mysqlctl lag -d slave1,slave2,slave3
+  replctl lag -d slave1 -d slave2 -d slave3
+  replctl lag -d slave1,slave2,slave3
 
   # Replicas on a non-standard port with dedicated credentials
-  mysqlctl lag -d slave1,slave2 --dst-port 3307 --dst-user monitor --dst-password monpass
+  replctl lag -d slave1,slave2 --dst-port 3307 --dst-user monitor --dst-password monpass
 
   # Auto-refresh every 3 seconds
-  mysqlctl lag -d slave1 --watch --interval 3s
+  replctl lag -d slave1 --watch --interval 3s
 
   # JSON output for scripting
-  mysqlctl lag -d slave1 --json`,
+  replctl lag -d slave1 --json`,
 	RunE: runLag,
 }
 
@@ -51,27 +51,9 @@ func init() {
 func runLag(cmd *cobra.Command, _ []string) error {
 	ctx := cmd.Context()
 
-	if len(Cfg.Dst) == 0 {
+	hosts := splitHosts(Cfg.Dst)
+	if len(hosts) == 0 {
 		return fmt.Errorf("--dst is required")
-	}
-
-	if err := askUser(&Cfg.User, cmd.Root().PersistentFlags().Changed("user") || userSetFromConfig); err != nil {
-		return err
-	}
-	if dstPassword() == "" {
-		if err := askPassword(&Cfg.Password, "MySQL password ("+Cfg.User+")"); err != nil {
-			return err
-		}
-	}
-
-	// Flatten comma-separated values (e.g. -d "h1,h2,h3").
-	var hosts []string
-	for _, d := range Cfg.Dst {
-		for _, h := range strings.Split(d, ",") {
-			if h = strings.TrimSpace(h); h != "" {
-				hosts = append(hosts, h)
-			}
-		}
 	}
 
 	if Cfg.Demo {
@@ -83,10 +65,14 @@ func runLag(cmd *cobra.Command, _ []string) error {
 		return nil
 	}
 
+	if err := promptCredentials(cmd, false, true); err != nil {
+		return err
+	}
+
 	if lagFlags.Watch {
 		for {
 			fmt.Print("\033[2J\033[H") // clear screen
-			fmt.Printf("mysqlctl lag  —  %s  (interval: %s)\n\n",
+			fmt.Printf("replctl lag  —  %s  (interval: %s)\n\n",
 				time.Now().Format("2006-01-02 15:04:05"), lagFlags.Interval)
 			_ = printLagForHosts(ctx, hosts)
 			select {
@@ -114,23 +100,17 @@ type lagResult struct {
 func printLagForHosts(ctx context.Context, hosts []string) int {
 	perHost := make([][]lagResult, len(hosts))
 	var wg sync.WaitGroup
-	for i, h := range hosts {
-		wg.Add(1)
-		go func(idx int, host string) {
-			defer wg.Done()
+	for idx, host := range hosts {
+		wg.Go(func() {
 			qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			defer cancel()
-			c, err := mysqlpkg.NewClient(mysqlpkg.Config{
+			c := mysqlpkg.NewClient(mysqlpkg.Config{
 				Host:     host,
 				Port:     dstPort(),
 				User:     dstUser(),
 				Password: dstPassword(),
 				Timeout:  10 * time.Second,
 			})
-			if err != nil {
-				perHost[idx] = []lagResult{{host: host, err: err}}
-				return
-			}
 			defer c.Close()
 			all, err := mysqlpkg.GetReplicaStatuses(qctx, c)
 			switch {
@@ -143,7 +123,7 @@ func printLagForHosts(ctx context.Context, hosts []string) int {
 					perHost[idx] = append(perHost[idx], lagResult{host: host, status: s})
 				}
 			}
-		}(i, h)
+		})
 	}
 	wg.Wait()
 
@@ -157,7 +137,7 @@ func printLagForHosts(ctx context.Context, hosts []string) int {
 	}
 
 	if Cfg.JSON {
-		printLagJSON(results)
+		printLagJSON(os.Stdout, results)
 		return failed
 	}
 
@@ -226,14 +206,10 @@ func printReplicaStatus(s *mysqlpkg.ReplicaStatus) {
 func printLagTable(results []lagResult) {
 	table := tablewriter.NewWriter(os.Stdout)
 	table.SetHeader([]string{"Host", "IO", "SQL", "Lag (s)", "Source", "Last Error"})
-	table.SetHeaderColor(
-		tablewriter.Colors{tablewriter.Bold},
-		tablewriter.Colors{tablewriter.Bold},
-		tablewriter.Colors{tablewriter.Bold},
-		tablewriter.Colors{tablewriter.Bold},
-		tablewriter.Colors{tablewriter.Bold},
-		tablewriter.Colors{tablewriter.Bold},
-	)
+	if !color.NoColor { // respects NO_COLOR and non-terminal output
+		bold := tablewriter.Colors{tablewriter.Bold}
+		table.SetHeaderColor(bold, bold, bold, bold, bold, bold)
+	}
 	table.SetBorder(true)
 	table.SetRowLine(false)
 
@@ -266,13 +242,13 @@ type lagJSON struct {
 	SourceHost    string `json:"source_host,omitempty"`
 	IORunning     bool   `json:"io_running"`
 	SQLRunning    bool   `json:"sql_running"`
-	SecondsBehind int    `json:"seconds_behind"`
+	SecondsBehind *int   `json:"seconds_behind"` // null when unknown: stopped, not configured or unreachable
 	IsConfigured  bool   `json:"configured"`
 	LastError     string `json:"last_error,omitempty"`
 	Error         string `json:"error,omitempty"`
 }
 
-func printLagJSON(results []lagResult) {
+func printLagJSON(w io.Writer, results []lagResult) {
 	out := make([]lagJSON, len(results))
 	for i, r := range results {
 		j := lagJSON{Host: r.host}
@@ -284,13 +260,15 @@ func printLagJSON(results []lagResult) {
 			j.SourceHost = s.SourceHost
 			j.IORunning = s.IORunningBool()
 			j.SQLRunning = s.SQLRunningBool()
-			j.SecondsBehind = s.SecondsBehindInt()
+			if lag := s.SecondsBehindInt(); lag >= 0 {
+				j.SecondsBehind = &lag
+			}
 			j.IsConfigured = s.IsConfigured
 			j.LastError = s.LastError
 		}
 		out[i] = j
 	}
-	enc := json.NewEncoder(os.Stdout)
+	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	if len(out) == 1 {
 		_ = enc.Encode(out[0])

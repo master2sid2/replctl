@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/fatih/color"
-	mysqlpkg "github.com/local/mysqlctl/internal/mysql"
+	mysqlpkg "github.com/master2sid2/replctl/internal/mysql"
 )
 
-const demoBanner = "\033[1;33m[DEMO MODE]\033[0m"
+var demoBanner = color.New(color.FgYellow, color.Bold).Sprint("[DEMO MODE]")
 
 // demoClone simulates the full clone workflow with per-stage progress display.
 func demoClone(ctx context.Context, src, dst string) error {
@@ -38,12 +38,10 @@ func demoClone(ctx context.Context, src, dst string) error {
 	slog.Debug("[demo] SELECT PLUGIN_STATUS FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME='clone'", "host", dst)
 	color.New(color.FgYellow).Printf("  ✓ clone plugin active on %s\n", dst)
 
-	info.Println("[2/4] Creating clone users...")
+	info.Println("[2/4] Creating clone user on source...")
 	demoSleep(ctx, 500*time.Millisecond)
-	slog.Debug("[demo] CREATE USER IF NOT EXISTS 'clone_user'@'10.0.0.2' ... GRANT BACKUP_ADMIN", "host", src)
+	slog.Debug("[demo] CREATE USER 'clone_user'@'10.0.0.2' ... GRANT BACKUP_ADMIN", "host", src)
 	color.New(color.FgYellow).Printf("  ✓ clone_user@10.0.0.2 created on %s (BACKUP_ADMIN)\n", src)
-	slog.Debug("[demo] CREATE USER IF NOT EXISTS 'clone_user'@'10.0.0.1' ... GRANT CLONE_ADMIN", "host", dst)
-	color.New(color.FgYellow).Printf("  ✓ clone_user@10.0.0.1 created on %s (CLONE_ADMIN)\n", dst)
 
 	info.Println("[3/4] Cloning...")
 	totalStart := time.Now()
@@ -92,7 +90,6 @@ func demoRunClone(ctx context.Context) error {
 	spinChars := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	spinIdx := 0
 	green := color.New(color.FgGreen)
-
 
 	for _, stage := range stages {
 		stageDur := time.Duration(float64(totalDuration) * stage.portion)
@@ -188,7 +185,7 @@ func demoSwitch(ctx context.Context, src, dst string) error {
 
 	info.Println("\n[1/2] Creating replication user on source...")
 	demoSleep(ctx, 600*time.Millisecond)
-	slog.Debug("[demo] CREATE USER IF NOT EXISTS '"+Cfg.ReplUser+"'@'10.0.0.2' ... GRANT REPLICATION SLAVE", "host", src)
+	slog.Debug("[demo] CREATE USER '"+Cfg.ReplUser+"'@'10.0.0.2' ... GRANT REPLICATION SLAVE", "host", src)
 	yellow.Printf("  ✓ %s@10.0.0.2 created on %s (REPLICATION SLAVE)\n", Cfg.ReplUser, src)
 
 	info.Println("[2/2] Configuring replication on destination...")
@@ -243,7 +240,7 @@ func demoLag(hosts []string, asJSON bool) {
 	}
 
 	if asJSON {
-		printLagJSON(results)
+		printLagJSON(os.Stdout, results)
 		return
 	}
 	if len(hosts) == 1 {
@@ -258,7 +255,7 @@ func demoLagWatch(ctx context.Context, hosts []string, interval time.Duration) {
 	lags := make([]int, len(hosts))
 	for {
 		fmt.Print("\033[2J\033[H")
-		fmt.Printf("%s  mysqlctl lag  —  %s  (interval: %s)\n\n",
+		fmt.Printf("%s  replctl lag  —  %s  (interval: %s)\n\n",
 			demoBanner, time.Now().Format("2006-01-02 15:04:05"), interval)
 
 		var results []lagResult

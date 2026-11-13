@@ -1,2 +1,6 @@
-mysqlctl
+/replctl
+/mysqlctl
+/bin/
+/dist/
+.claude/
 bash.sh

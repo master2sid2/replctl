@@ -1,143 +1,74 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"os"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/fatih/color"
-	"github.com/local/mysqlctl/internal/dns"
-	mysqlpkg "github.com/local/mysqlctl/internal/mysql"
 	"github.com/spf13/cobra"
+
+	mysqlpkg "github.com/master2sid2/replctl/internal/mysql"
 )
 
 var cloneCmd = &cobra.Command{
 	Use:   "clone",
 	Short: "Clone source database to destination using MySQL clone plugin",
-	Long: `Installs the clone plugin on both servers, creates temporary clone users,
-executes CLONE INSTANCE FROM (with live per-stage progress), waits for destination
-MySQL to restart, verifies clone_status, then cleans up all temporary objects.`,
+	Long: `Installs the clone plugin on both servers, creates a temporary clone user on
+the source, executes CLONE INSTANCE FROM on the destination (with live per-stage
+progress), waits for destination MySQL to restart, verifies clone_status, then
+cleans up all temporary objects.`,
 	Example: `  # Basic clone using shared credentials
-  mysqlctl clone -s db1.example.com -d db2.example.com -u root -p secret --clone-password clonepass
+  replctl clone -s db1.example.com -d db2.example.com -u root --clone-password clonepass
 
   # Different ports on source and destination
-  mysqlctl clone -s db1 -d db2 --src-port 3307 --dst-port 3308 --clone-password clonepass
+  replctl clone -s db1 -d db2 --src-port 3307 --dst-port 3308 --clone-password clonepass
 
   # Different credentials on source and destination
-  mysqlctl clone -s db1 -d db2 --src-user admin --dst-user replicator \
+  replctl clone -s db1 -d db2 --src-user admin --dst-user dba \
     --src-password srcpass --dst-password dstpass --clone-password clonepass
 
+  # Servers talk over a private network the operator machine cannot see
+  replctl clone -s db1.example.com -d db2.example.com --src-ip 10.0.0.1 --dst-ip 10.0.0.2
+
   # Dry-run to preview SQL without executing
-  mysqlctl clone -s db1 -d db2 --dry-run --clone-password clonepass
+  replctl clone -s db1 -d db2 --dry-run --clone-password clonepass
 
   # Custom timeout for large databases
-  mysqlctl clone -s db1 -d db2 --timeout 24h --clone-password clonepass`,
+  replctl clone -s db1 -d db2 --timeout 24h --clone-password clonepass`,
 	RunE: runClone,
 }
-
-// errCancelled is returned when the operator does not confirm the operation.
-var errCancelled = errors.New("cancelled by user, nothing was changed")
 
 func runClone(cmd *cobra.Command, _ []string) error {
 	ctx, cancel := context.WithTimeout(cmd.Context(), Cfg.Timeout)
 	defer cancel()
 
-	if Cfg.Src == "" {
-		return fmt.Errorf("--src is required")
-	}
-	dst, err := singleDst()
+	dst, err := pairDst()
 	if err != nil {
 		return err
 	}
-
-	if Cfg.Src == dst {
-		return fmt.Errorf("source and destination must be different hosts")
-	}
-
 	if Cfg.Demo {
 		return demoClone(ctx, Cfg.Src, dst)
 	}
 
-	// Prompt for credentials not set via flag or config.
-	if err := askUser(&Cfg.User, cmd.Root().PersistentFlags().Changed("user") || userSetFromConfig); err != nil {
+	if err := promptCredentials(cmd, true, true); err != nil {
 		return err
-	}
-	// Prompt for shared password only when needed (per-host passwords may cover both sides).
-	if srcPassword() == "" || dstPassword() == "" {
-		if err := askPassword(&Cfg.Password, "MySQL password ("+Cfg.User+")"); err != nil {
-			return err
-		}
 	}
 	if err := requirePassword(&Cfg.ClonePassword, "Clone user password", "clone-password"); err != nil {
 		return err
 	}
 
-	// Resolve hostnames to IPs in parallel.
-	var (
-		srcIP, dstIP string
-		resolveErr   [2]error
-		wg           sync.WaitGroup
-	)
-	wg.Add(2)
-	go func() { defer wg.Done(); srcIP, resolveErr[0] = dns.Resolve(Cfg.Src) }()
-	go func() { defer wg.Done(); dstIP, resolveErr[1] = dns.Resolve(dst) }()
-	wg.Wait()
-	if resolveErr[0] != nil {
-		return fmt.Errorf("resolve src: %w", resolveErr[0])
-	}
-	if resolveErr[1] != nil {
-		return fmt.Errorf("resolve dst: %w", resolveErr[1])
+	srcIP, dstIP, err := addresses(dst)
+	if err != nil {
+		return err
 	}
 
 	var srcClient, dstClient *mysqlpkg.Client
-
 	if !Cfg.DryRun {
-		// Check connectivity to both servers in parallel.
-		var connErr [2]error
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: Cfg.Src, User: srcUser(), Password: srcPassword(), Port: srcPort(), Timeout: 30 * time.Second})
-			if err != nil {
-				connErr[0] = err
-				return
-			}
-			if err := c.Ping(ctx); err != nil {
-				connErr[0] = fmt.Errorf("ping %s: %w", Cfg.Src, err)
-				c.Close()
-				return
-			}
-			srcClient = c
-		}()
-		go func() {
-			defer wg.Done()
-			c, err := mysqlpkg.NewClient(mysqlpkg.Config{Host: dst, User: dstUser(), Password: dstPassword(), Port: dstPort(), Timeout: 30 * time.Second})
-			if err != nil {
-				connErr[1] = err
-				return
-			}
-			if err := c.Ping(ctx); err != nil {
-				connErr[1] = fmt.Errorf("ping %s: %w", dst, err)
-				c.Close()
-				return
-			}
-			dstClient = c
-		}()
-		wg.Wait()
-		if connErr[0] != nil {
-			if dstClient != nil {
-				dstClient.Close()
-			}
-			return connErr[0]
-		}
-		if connErr[1] != nil {
-			srcClient.Close()
-			return connErr[1]
+		if srcClient, dstClient, err = connectPair(ctx, dst); err != nil {
+			return err
 		}
 		// dstClient is replaced after the restart, so close whatever is current on exit.
 		defer func() {
@@ -171,13 +102,9 @@ func runClone(cmd *cobra.Command, _ []string) error {
 	}
 
 	if !Cfg.DryRun {
-		fmt.Print("Continue? (Y/y to confirm): ")
-		scanner := bufio.NewScanner(os.Stdin)
-		scanner.Scan()
-		if answer := strings.TrimSpace(scanner.Text()); answer != "Y" && answer != "y" {
-			return errCancelled
+		if err := confirm("Continue?"); err != nil {
+			return err
 		}
-
 		// From here on the servers are modified: remove every clone artifact on
 		// any exit path — failure, Ctrl+C and timeout included.
 		defer cleanup()
@@ -194,9 +121,9 @@ func runClone(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
-	// Step 2: Create clone users.
-	info.Println("[2/4] Creating clone users...")
-	if err := mysqlpkg.CreateCloneUsers(ctx, srcClient, dstClient, srcIP, dstIP, Cfg.ClonePassword, Cfg.DryRun, Cfg.NativeAuth); err != nil {
+	// Step 2: Create the clone user on the donor.
+	info.Println("[2/4] Creating clone user on source...")
+	if err := mysqlpkg.CreateCloneUser(ctx, srcClient, srcIP, dstIP, Cfg.ClonePassword, Cfg.DryRun, Cfg.NativeAuth); err != nil {
 		return err
 	}
 
@@ -209,64 +136,61 @@ func runClone(cmd *cobra.Command, _ []string) error {
 	totalStart := time.Now()
 	var cloneClient *mysqlpkg.Client
 	if !Cfg.DryRun {
-		cloneClient, err = mysqlpkg.NewClient(mysqlpkg.Config{
+		cloneClient = mysqlpkg.NewClient(mysqlpkg.Config{
 			Host: dst, User: dstUser(), Password: dstPassword(),
 			Port: dstPort(), Timeout: 30 * time.Second, ReadTimeout: -1,
 		})
-		if err != nil {
-			return fmt.Errorf("open clone connection: %w", err)
-		}
 		defer cloneClient.Close()
 	}
 	since, err := mysqlpkg.RunClone(ctx, cloneClient, dstClient, srcIP, srcPort(), Cfg.ClonePassword, Cfg.DryRun)
 	if err != nil {
-		if !Cfg.DryRun {
+		if ce, ok := errors.AsType[*mysqlpkg.CloneError](err); ok && !ce.DataDropped {
+			info.Fprintln(os.Stderr, "Clone did not start copying: the destination still holds its previous data.")
+		} else {
 			warn.Fprintln(os.Stderr, "Clone did not complete: CLONE drops the existing data first, so the destination may now be empty or incomplete.")
 		}
 		return err
+	}
+	if Cfg.DryRun {
+		info.Println("\nDry run: nothing was changed.")
+		return nil
 	}
 
 	// Step 4: Wait for MySQL restart + verify clone completed on server side.
 	// Success is reported only when clone_status shows that the clone started by
 	// this run is Completed; a dropped connection is never treated as success.
-	if !Cfg.DryRun {
-		info.Println("[4/4] Waiting for destination MySQL to restart...")
-		if err := mysqlpkg.WaitForMySQL(ctx, dst, dstPort(), dstUser(), dstPassword(), 5*time.Minute); err != nil {
-			return err
-		}
+	info.Println("[4/4] Waiting for destination MySQL to restart...")
+	if err := mysqlpkg.WaitForMySQL(ctx, dst, dstPort(), dstUser(), dstPassword(), 5*time.Minute); err != nil {
+		return err
+	}
 
-		// Re-open connection to the now-restarted dst.
-		fresh, err := mysqlpkg.NewClient(mysqlpkg.Config{
-			Host: dst, User: dstUser(), Password: dstPassword(),
-			Port: dstPort(), Timeout: 30 * time.Second,
-		})
-		if err != nil {
-			return fmt.Errorf("reconnect dst after restart: %w", err)
-		}
-		dstClient.Close()
-		dstClient = fresh
+	// Re-open connection to the now-restarted dst.
+	dstClient.Close()
+	dstClient = mysqlpkg.NewClient(mysqlpkg.Config{
+		Host: dst, User: dstUser(), Password: dstPassword(),
+		Port: dstPort(), Timeout: 30 * time.Second,
+	})
 
-		info.Println("Verifying clone status...")
-		if err := mysqlpkg.VerifyCloneStatus(ctx, dstClient, since, 2*time.Minute); err != nil {
-			warn.Fprintln(os.Stderr, "Clone is NOT confirmed: do not use the destination until it is cloned again.")
-			return err
-		}
+	info.Println("Verifying clone status...")
+	if err := mysqlpkg.VerifyCloneStatus(ctx, dstClient, since, 2*time.Minute); err != nil {
+		warn.Fprintln(os.Stderr, "Clone is NOT confirmed: do not use the destination until it is cloned again.")
+		return err
+	}
 
-		total := time.Since(totalStart).Round(time.Second)
-		info.Printf("Total time: %s\n", formatDuration(total))
+	total := time.Since(totalStart).Round(time.Second)
+	info.Printf("Total time: %s\n", formatDuration(total))
 
-		if !cleanup() {
-			// The data is fine, but leftovers remain: make that visible in the exit code.
-			return fmt.Errorf("clone completed, but cleanup failed")
-		}
+	if !cleanup() {
+		// The data is fine, but leftovers remain: make that visible in the exit code.
+		return errors.New("clone completed, but cleanup failed")
 	}
 
 	info.Println("\nDone. Destination database is a fresh copy of source.")
 	return nil
 }
 
-// cloneInspect refuses to clone an instance onto itself and shows what is about to
-// be destroyed on dst, plus source properties that change how dst behaves afterwards.
+// cloneInspect refuses clones that cannot work and shows what is about to be
+// destroyed on dst, plus source properties that change how dst behaves afterwards.
 func cloneInspect(ctx context.Context, src, dst *mysqlpkg.Client) error {
 	si, err := mysqlpkg.GetServerInfo(ctx, src)
 	if err != nil {
@@ -278,6 +202,9 @@ func cloneInspect(ctx context.Context, src, dst *mysqlpkg.Client) error {
 	}
 	if si.UUID == di.UUID {
 		return fmt.Errorf("source and destination are the same MySQL instance (server_uuid %s)", si.UUID)
+	}
+	if err := mysqlpkg.CheckCloneVersions(si.Version, di.Version); err != nil {
+		return err
 	}
 
 	note := color.New(color.FgYellow)

@@ -67,3 +67,47 @@ func GetDataSummary(ctx context.Context, c *Client) (*DataSummary, error) {
 	d.EnabledEvents, _ = strconv.Atoi(m["n_events"])
 	return d, nil
 }
+
+// CheckCloneVersions reports why a server running donor cannot be cloned onto
+// one running recipient, before the clone is started: the clone plugin needs
+// 8.0.17+ and the same version series on both sides; before 8.0.37 the exact
+// same version. Versions that cannot be parsed are left to the server to judge.
+func CheckCloneVersions(donor, recipient string) error {
+	d, ok1 := parseVersion(donor)
+	r, ok2 := parseVersion(recipient)
+	if !ok1 || !ok2 {
+		return nil
+	}
+	sameSeries := d[0] == r[0] && d[1] == r[1]
+	switch {
+	case !atLeast(d, 8, 0, 17) || !atLeast(r, 8, 0, 17):
+		return fmt.Errorf("the clone plugin needs MySQL 8.0.17 or later (source %s, destination %s)", donor, recipient)
+	case !sameSeries:
+		return fmt.Errorf("source runs MySQL %s and destination %s: clone needs the same version series on both", donor, recipient)
+	case d[2] != r[2] && d[0] == 8 && d[1] == 0 && min(d[2], r[2]) < 37:
+		return fmt.Errorf("source runs MySQL %s and destination %s: before 8.0.37 clone needs exactly the same version", donor, recipient)
+	}
+	return nil
+}
+
+// parseVersion reads "8.4.3" out of version strings like "8.4.3-log".
+func parseVersion(v string) ([3]int, bool) {
+	var out [3]int
+	v, _, _ = strings.Cut(v, "-")
+	parts := strings.Split(v, ".")
+	if len(parts) < 3 {
+		return out, false
+	}
+	for i := range out {
+		n, err := strconv.Atoi(parts[i])
+		if err != nil {
+			return out, false
+		}
+		out[i] = n
+	}
+	return out, true
+}
+
+func atLeast(v [3]int, major, minor, patch int) bool {
+	return v[0] > major || v[0] == major && (v[1] > minor || v[1] == minor && v[2] >= patch)
+}

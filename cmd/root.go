@@ -1,13 +1,12 @@
 package cmd
 
 import (
+	"cmp"
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -16,13 +15,16 @@ import (
 )
 
 // userSetFromConfig is true when mysql_user came from the config file or environment.
-// Used by askUser to skip interactive prompting when a user is already provided.
+// Used by promptCredentials to skip interactive prompting when a user is already provided.
 var userSetFromConfig bool
 
 // Cfg holds values resolved from flags + config file.
 var Cfg struct {
+	ConfigFile    string
 	Src           string
 	Dst           []string
+	SrcIP         string
+	DstIP         string
 	Port          int
 	SrcPort       int
 	DstPort       int
@@ -37,71 +39,31 @@ var Cfg struct {
 	ReplPassword  string
 	Timeout       time.Duration
 	DryRun        bool
+	Yes           bool
 	JSON          bool
 	Verbose       bool
 	Demo          bool
 	NativeAuth    bool
 }
 
-// singleDst returns the destination for commands that work on exactly one src → dst pair.
-func singleDst() (string, error) {
-	if len(Cfg.Dst) == 0 {
-		return "", fmt.Errorf("--dst is required")
-	}
-	if len(Cfg.Dst) > 1 || strings.Contains(Cfg.Dst[0], ",") {
-		return "", fmt.Errorf("this command works with exactly one destination, got %q", strings.Join(Cfg.Dst, ","))
-	}
-	return Cfg.Dst[0], nil
-}
+func srcPort() int { return cmp.Or(Cfg.SrcPort, Cfg.Port) }
+func dstPort() int { return cmp.Or(Cfg.DstPort, Cfg.Port) }
 
-func srcPort() int {
-	if Cfg.SrcPort != 0 {
-		return Cfg.SrcPort
-	}
-	return Cfg.Port
-}
+func srcUser() string { return cmp.Or(Cfg.SrcUser, Cfg.User) }
+func dstUser() string { return cmp.Or(Cfg.DstUser, Cfg.User) }
 
-func dstPort() int {
-	if Cfg.DstPort != 0 {
-		return Cfg.DstPort
-	}
-	return Cfg.Port
-}
-
-func srcUser() string {
-	if Cfg.SrcUser != "" {
-		return Cfg.SrcUser
-	}
-	return Cfg.User
-}
-
-func dstUser() string {
-	if Cfg.DstUser != "" {
-		return Cfg.DstUser
-	}
-	return Cfg.User
-}
-
-func srcPassword() string {
-	if Cfg.SrcPassword != "" {
-		return Cfg.SrcPassword
-	}
-	return Cfg.Password
-}
-
-func dstPassword() string {
-	if Cfg.DstPassword != "" {
-		return Cfg.DstPassword
-	}
-	return Cfg.Password
-}
+func srcPassword() string { return cmp.Or(Cfg.SrcPassword, Cfg.Password) }
+func dstPassword() string { return cmp.Or(Cfg.DstPassword, Cfg.Password) }
 
 var rootCmd = &cobra.Command{
-	Use:   "mysqlctl",
-	Short: "MySQL clone and replication management tool",
-	Long: `mysqlctl manages MySQL cloning and replication.
+	Use:   "replctl",
+	Short: "Clone MySQL servers and set up or repoint replicas",
+	Long: `replctl builds and maintains MySQL replicas: it clones a source onto a
+destination with the clone plugin, sets up or repoints GTID replication, and
+shows replication status across replicas.
 
-Config file: ~/.mysqlctl.yaml
+Config file: ~/.config/replctl/config.yaml ($XDG_CONFIG_HOME is honoured),
+or the file given with --config:
   port: 3306
   src_port: 0            # overrides port for source only
   dst_port: 0            # overrides port for destination only
@@ -111,11 +73,14 @@ Config file: ~/.mysqlctl.yaml
   mysql_password: ""
   src_password: ""       # overrides password for source only
   dst_password: ""       # overrides password for destination only
-  clone_password: "changeme"
+  clone_password: ""
   repl_user: replicator
-  repl_password: "changeme"
+  repl_password: ""
   timeout: 12h
+
+Environment variables use the REPLCTL_ prefix, e.g. REPLCTL_MYSQL_PASSWORD.
 `,
+	Version:       buildVersion(),
 	SilenceUsage:  true,
 	SilenceErrors: true,
 }
@@ -139,11 +104,16 @@ func Execute() {
 
 func init() {
 	cobra.OnInitialize(initConfig)
+	rootCmd.SetVersionTemplate(versionTemplate())
 
 	pf := rootCmd.PersistentFlags()
 
+	pf.StringVar(&Cfg.ConfigFile, "config", "", "config file (default ~/.config/replctl/config.yaml)")
+
 	pf.StringVarP(&Cfg.Src, "src", "s", "", "source MySQL host (IP or FQDN)")
 	pf.StringArrayVarP(&Cfg.Dst, "dst", "d", nil, "destination host(s); repeat or comma-separate for multi-host lag")
+	pf.StringVar(&Cfg.SrcIP, "src-ip", "", "address the destination uses to reach the source (default: --src resolved here)")
+	pf.StringVar(&Cfg.DstIP, "dst-ip", "", "address the source sees the destination connecting from (default: --dst resolved here)")
 	pf.IntVar(&Cfg.Port, "port", 3306, "MySQL port (default for both src and dst)")
 	pf.IntVar(&Cfg.SrcPort, "src-port", 0, "source MySQL port (overrides --port)")
 	pf.IntVar(&Cfg.DstPort, "dst-port", 0, "destination MySQL port (overrides --port)")
@@ -158,94 +128,81 @@ func init() {
 	pf.StringVar(&Cfg.ReplPassword, "repl-password", "", "replication user password")
 	pf.DurationVar(&Cfg.Timeout, "timeout", 12*time.Hour, "overall time limit for clone/switch; a running CLONE is killed when it expires")
 	pf.BoolVar(&Cfg.DryRun, "dry-run", false, "print SQL without executing")
+	pf.BoolVarP(&Cfg.Yes, "yes", "y", false, "do not ask for confirmation (for scripts)")
 	pf.BoolVar(&Cfg.JSON, "json", false, "output results as JSON")
 	pf.BoolVarP(&Cfg.Verbose, "verbose", "v", false, "enable debug logging")
 	pf.BoolVar(&Cfg.Demo, "demo", false, "demo mode: simulate all operations without real MySQL")
-	pf.BoolVar(&Cfg.NativeAuth, "native-auth", false, "use IDENTIFIED WITH mysql_native_password (for MySQL ≤ 8.0)")
+	pf.BoolVar(&Cfg.NativeAuth, "native-auth", false,
+		"create users WITH mysql_native_password (deprecated; disabled by default in 8.4, removed in 9.0)")
 
-	_ = viper.BindPFlag("port", pf.Lookup("port"))
-	_ = viper.BindPFlag("src_port", pf.Lookup("src-port"))
-	_ = viper.BindPFlag("dst_port", pf.Lookup("dst-port"))
-	_ = viper.BindPFlag("mysql_user", pf.Lookup("user"))
-	_ = viper.BindPFlag("src_user", pf.Lookup("src-user"))
-	_ = viper.BindPFlag("dst_user", pf.Lookup("dst-user"))
-	_ = viper.BindPFlag("mysql_password", pf.Lookup("password"))
-	_ = viper.BindPFlag("src_password", pf.Lookup("src-password"))
-	_ = viper.BindPFlag("dst_password", pf.Lookup("dst-password"))
-	_ = viper.BindPFlag("clone_password", pf.Lookup("clone-password"))
-	_ = viper.BindPFlag("repl_user", pf.Lookup("repl-user"))
-	_ = viper.BindPFlag("repl_password", pf.Lookup("repl-password"))
-	_ = viper.BindPFlag("timeout", pf.Lookup("timeout"))
+	for key, flag := range map[string]string{
+		"port": "port", "src_port": "src-port", "dst_port": "dst-port",
+		"mysql_user": "user", "src_user": "src-user", "dst_user": "dst-user",
+		"mysql_password": "password", "src_password": "src-password", "dst_password": "dst-password",
+		"clone_password": "clone-password", "repl_user": "repl-user", "repl_password": "repl-password",
+		"timeout": "timeout",
+	} {
+		_ = viper.BindPFlag(key, pf.Lookup(flag))
+	}
 
 	rootCmd.AddCommand(cloneCmd, switchCmd, lagCmd)
 }
 
 func initConfig() {
-	viper.SetConfigName(".mysqlctl")
-	viper.SetConfigType("yaml")
-	viper.AddConfigPath("$HOME")
-	viper.AddConfigPath(".")
-	viper.SetEnvPrefix("MYSQLCTL")
+	viper.SetEnvPrefix("REPLCTL")
 	viper.AutomaticEnv()
 
-	if err := viper.ReadInConfig(); err != nil {
-		// Only a missing config is fine; a broken one must not silently fall back to defaults.
-		var notFound viper.ConfigFileNotFoundError
-		if !errors.As(err, &notFound) {
-			fmt.Fprintf(os.Stderr, "error: config file: %v\n", err)
-			os.Exit(1)
-		}
+	if err := readConfig(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: config file: %v\n", err)
+		os.Exit(1)
 	}
 
 	// Pull values from viper into Cfg (flags take priority, already bound above).
-	if !rootCmd.PersistentFlags().Changed("port") {
+	changed := rootCmd.PersistentFlags().Changed
+	if !changed("port") {
 		Cfg.Port = viper.GetInt("port")
 	}
-	if !rootCmd.PersistentFlags().Changed("src-port") {
+	if !changed("src-port") {
 		Cfg.SrcPort = viper.GetInt("src_port")
 	}
-	if !rootCmd.PersistentFlags().Changed("dst-port") {
+	if !changed("dst-port") {
 		Cfg.DstPort = viper.GetInt("dst_port")
 	}
-	if !rootCmd.PersistentFlags().Changed("user") {
+	if !changed("user") {
 		if u := viper.GetString("mysql_user"); u != "" {
 			Cfg.User = u
 			// GetString also returns the flag default, so check where the value came from.
-			_, fromEnv := os.LookupEnv("MYSQLCTL_MYSQL_USER")
+			_, fromEnv := os.LookupEnv("REPLCTL_MYSQL_USER")
 			userSetFromConfig = viper.InConfig("mysql_user") || fromEnv
 		}
 	}
-	if !rootCmd.PersistentFlags().Changed("src-user") {
-		if u := viper.GetString("src_user"); u != "" {
-			Cfg.SrcUser = u
-		}
+	if !changed("src-user") {
+		Cfg.SrcUser = viper.GetString("src_user")
 	}
-	if !rootCmd.PersistentFlags().Changed("dst-user") {
-		if u := viper.GetString("dst_user"); u != "" {
-			Cfg.DstUser = u
-		}
+	if !changed("dst-user") {
+		Cfg.DstUser = viper.GetString("dst_user")
 	}
-	if !rootCmd.PersistentFlags().Changed("password") {
+	if !changed("password") {
 		Cfg.Password = viper.GetString("mysql_password")
 	}
-	if !rootCmd.PersistentFlags().Changed("src-password") {
+	if !changed("src-password") {
 		Cfg.SrcPassword = viper.GetString("src_password")
 	}
-	if !rootCmd.PersistentFlags().Changed("dst-password") {
+	if !changed("dst-password") {
 		Cfg.DstPassword = viper.GetString("dst_password")
 	}
-	if !rootCmd.PersistentFlags().Changed("clone-password") {
+	if !changed("clone-password") {
 		Cfg.ClonePassword = viper.GetString("clone_password")
 	}
-	if !rootCmd.PersistentFlags().Changed("repl-user") {
+	if !changed("repl-user") {
 		if u := viper.GetString("repl_user"); u != "" {
 			Cfg.ReplUser = u
 		}
 	}
-	if !rootCmd.PersistentFlags().Changed("repl-password") {
+	if !changed("repl-password") {
 		Cfg.ReplPassword = viper.GetString("repl_password")
 	}
-	if !rootCmd.PersistentFlags().Changed("timeout") {
+	if !changed("timeout") {
 		if t := viper.GetDuration("timeout"); t > 0 {
 			Cfg.Timeout = t
 		}

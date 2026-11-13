@@ -103,20 +103,8 @@ func CheckReplicationPrereqs(ctx context.Context, src, dst *Client) (warnings []
 	if err != nil {
 		return nil, err
 	}
-
-	switch {
-	case si.UUID == di.UUID:
-		return nil, fmt.Errorf("source and destination are the same MySQL instance (server_uuid %s)", si.UUID)
-	case si.ServerID == di.ServerID:
-		return nil, fmt.Errorf("source and destination have the same server_id (%s)", si.ServerID)
-	case si.ServerID == "0" || di.ServerID == "0":
-		return nil, fmt.Errorf("server_id must be non-zero on both servers")
-	case si.GTIDMode != "ON":
-		return nil, fmt.Errorf("gtid_mode is %s on source %s, must be ON", si.GTIDMode, src.Host())
-	case di.GTIDMode != "ON":
-		return nil, fmt.Errorf("gtid_mode is %s on destination %s, must be ON", di.GTIDMode, dst.Host())
-	case !si.LogBin:
-		return nil, fmt.Errorf("binary logging is disabled on source %s", src.Host())
+	if err := checkReplicationPair(si, di, src.Host(), dst.Host()); err != nil {
+		return nil, err
 	}
 
 	q := fmt.Sprintf(
@@ -137,11 +125,37 @@ func CheckReplicationPrereqs(ctx context.Context, src, dst *Client) (warnings []
 				"    if the source never receives them, the data on destination will differ from the source",
 			src.Host(), truncate(errant, 200)))
 	}
+	return append(warnings, replicationWarnings(di, dst.Host())...), nil
+}
+
+// checkReplicationPair finds settings that make GTID replication from src to
+// dst impossible.
+func checkReplicationPair(si, di *ServerInfo, srcHost, dstHost string) error {
+	switch {
+	case si.UUID == di.UUID:
+		return fmt.Errorf("source and destination are the same MySQL instance (server_uuid %s)", si.UUID)
+	case si.ServerID == "0" || di.ServerID == "0":
+		return fmt.Errorf("server_id must be non-zero on both servers")
+	case si.ServerID == di.ServerID:
+		return fmt.Errorf("source and destination have the same server_id (%s)", si.ServerID)
+	case si.GTIDMode != "ON":
+		return fmt.Errorf("gtid_mode is %s on source %s, must be ON", si.GTIDMode, srcHost)
+	case di.GTIDMode != "ON":
+		return fmt.Errorf("gtid_mode is %s on destination %s, must be ON", di.GTIDMode, dstHost)
+	case !si.LogBin:
+		return fmt.Errorf("binary logging is disabled on source %s", srcHost)
+	}
+	return nil
+}
+
+// replicationWarnings lists destination settings that are risky but allowed.
+func replicationWarnings(di *ServerInfo, dstHost string) []string {
+	var warnings []string
 	if !di.ReadOnly {
 		warnings = append(warnings, fmt.Sprintf(
-			"read_only is OFF on destination %s: writes made there will not exist on the source", dst.Host()))
+			"read_only is OFF on destination %s: writes made there will not exist on the source", dstHost))
 	}
-	return warnings, nil
+	return warnings
 }
 
 func truncate(s string, n int) string {
