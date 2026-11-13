@@ -120,21 +120,18 @@ func promptCredentials(cmd *cobra.Command, src, dst bool) error {
 	return nil
 }
 
-// requirePassword prompts for a password if ptr points to an empty string and
-// fails when none is given. flag is the CLI flag named in the error.
-func requirePassword(ptr *string, label, flag string) error {
+// generatedPasswordLength is the length of passwords replctl makes up for the
+// accounts it creates when none was configured.
+const generatedPasswordLength = 32
+
+// ensurePassword fills *ptr with a generated password when it is empty and
+// reports whether it did.
+func ensurePassword(ptr *string) bool {
 	if *ptr != "" {
-		return nil
+		return false
 	}
-	pass, err := promptPassword(label)
-	if err != nil {
-		return err
-	}
-	if pass == "" {
-		return fmt.Errorf("password is required; use --%s or enter it when prompted", flag)
-	}
-	*ptr = pass
-	return nil
+	*ptr = mysqlpkg.GeneratePassword(generatedPasswordLength)
+	return true
 }
 
 // confirm asks a yes/no question unless --yes was given.

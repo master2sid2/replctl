@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -61,9 +62,7 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 	if err := promptCredentials(cmd, true, true); err != nil {
 		return err
 	}
-	if err := requirePassword(&Cfg.ReplPassword, "Replication user password", "repl-password"); err != nil {
-		return err
-	}
+	generated := ensurePassword(&Cfg.ReplPassword)
 
 	srcIP, dstIP, err := addresses(dst)
 	if err != nil {
@@ -119,6 +118,9 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 	if err := mysqlpkg.CreateReplUser(ctx, srcClient, dstIP, Cfg.ReplUser, Cfg.ReplPassword, Cfg.DryRun, Cfg.NativeAuth); err != nil {
 		return fmt.Errorf("create repl user: %w", err)
 	}
+	if generated {
+		announcePassword(dstIP)
+	}
 
 	// Step 2: Configure replication on destination.
 	info.Println("[2/2] Configuring replication on destination...")
@@ -142,4 +144,22 @@ func runSwitch(cmd *cobra.Command, _ []string) error {
 		}
 	}
 	return runErr
+}
+
+// announcePassword shows a generated replication password once, right after
+// the account was created with it. JSON output keeps stdout machine-readable,
+// so the notice goes to stderr then.
+func announcePassword(dstIP string) {
+	acct := fmt.Sprintf("'%s'@'%s'", Cfg.ReplUser, dstIP)
+	w := io.Writer(os.Stdout)
+	if Cfg.JSON {
+		w = os.Stderr
+	}
+	note := color.New(color.FgYellow)
+	if Cfg.DryRun {
+		note.Fprintf(w, "  ! no --repl-password given: a random password will be generated for %s\n", acct)
+		return
+	}
+	note.Fprintf(w, "  ! generated password for %s: %s\n", acct, Cfg.ReplPassword)
+	note.Fprintln(w, "    replctl does not save it: keep it in a safe place (a password manager) if you need it later")
 }

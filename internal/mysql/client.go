@@ -42,6 +42,11 @@ func (cfg Config) driverConfig() *gmysql.Config {
 	}
 	c.ParseTime = true
 	c.InterpolateParams = true
+	// quote() escapes backslashes, which is only right while the session does
+	// not have NO_BACKSLASH_ESCAPES. Dropping it on every connection makes a
+	// password with a backslash mean the same on source and destination,
+	// whatever their global sql_mode. The driver runs "SET sql_mode=<value>".
+	c.Params = map[string]string{"sql_mode": "REPLACE(@@SESSION.sql_mode,'NO_BACKSLASH_ESCAPES','')"}
 	return c
 }
 

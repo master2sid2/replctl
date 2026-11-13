@@ -73,9 +73,9 @@ or the file given with --config:
   mysql_password: ""
   src_password: ""       # overrides password for source only
   dst_password: ""       # overrides password for destination only
-  clone_password: ""
+  clone_password: ""     # random if empty
   repl_user: replicator
-  repl_password: ""
+  repl_password: ""      # generated and shown once if empty
   timeout: 12h
 
 Environment variables use the REPLCTL_ prefix, e.g. REPLCTL_MYSQL_PASSWORD.
@@ -123,9 +123,9 @@ func init() {
 	pf.StringVarP(&Cfg.Password, "password", "p", "", "MySQL password (default for both src and dst)")
 	pf.StringVar(&Cfg.SrcPassword, "src-password", "", "source MySQL password (overrides --password)")
 	pf.StringVar(&Cfg.DstPassword, "dst-password", "", "destination MySQL password (overrides --password)")
-	pf.StringVar(&Cfg.ClonePassword, "clone-password", "", "clone_user password")
+	pf.StringVar(&Cfg.ClonePassword, "clone-password", "", "clone_user password (random if not set)")
 	pf.StringVar(&Cfg.ReplUser, "repl-user", "replicator", "replication user name")
-	pf.StringVar(&Cfg.ReplPassword, "repl-password", "", "replication user password")
+	pf.StringVar(&Cfg.ReplPassword, "repl-password", "", "replication user password (generated and shown once if not set)")
 	pf.DurationVar(&Cfg.Timeout, "timeout", 12*time.Hour, "overall time limit for clone/switch; a running CLONE is killed when it expires")
 	pf.BoolVar(&Cfg.DryRun, "dry-run", false, "print SQL without executing")
 	pf.BoolVarP(&Cfg.Yes, "yes", "y", false, "do not ask for confirmation (for scripts)")

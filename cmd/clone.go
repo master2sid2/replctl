@@ -56,9 +56,9 @@ func runClone(cmd *cobra.Command, _ []string) error {
 	if err := promptCredentials(cmd, true, true); err != nil {
 		return err
 	}
-	if err := requirePassword(&Cfg.ClonePassword, "Clone user password", "clone-password"); err != nil {
-		return err
-	}
+	// clone_user only lives for the duration of the clone: nobody needs to
+	// know its password, so make one up when none is configured.
+	ensurePassword(&Cfg.ClonePassword)
 
 	srcIP, dstIP, err := addresses(dst)
 	if err != nil {

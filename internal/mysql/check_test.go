@@ -125,3 +125,30 @@ func TestFormatting(t *testing.T) {
 		t.Errorf("unfinished stage = %s", got)
 	}
 }
+
+func TestGeneratePassword(t *testing.T) {
+	seen := map[string]bool{}
+	for range 200 {
+		p := GeneratePassword(32)
+		if len(p) != 32 || !hasEveryClass(p) {
+			t.Fatalf("bad password %q", p)
+		}
+		if strings.ContainsAny(p, "'\"\\`$ ") {
+			t.Fatalf("password %q needs quoting", p)
+		}
+		if seen[p] {
+			t.Fatalf("duplicate password %q", p)
+		}
+		seen[p] = true
+	}
+	if p := GeneratePassword(4); !hasEveryClass(p) {
+		t.Errorf("short password %q lacks a class", p)
+	}
+}
+
+func TestDriverConfigDropsNoBackslashEscapes(t *testing.T) {
+	c := Config{Host: "db1", Port: 3306}.driverConfig()
+	if v := c.Params["sql_mode"]; !strings.Contains(v, "NO_BACKSLASH_ESCAPES") || !strings.HasPrefix(v, "REPLACE(") {
+		t.Errorf("sql_mode param = %q", v)
+	}
+}
